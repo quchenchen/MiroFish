@@ -2,6 +2,10 @@
 Zep检索工具服务
 封装图谱搜索、节点读取、边查询等工具，供Report Agent使用
 
+支持两种模式:
+1. ZEP_USE_LOCAL=false: 使用 Zep Cloud (zep_cloud.client.Zep)
+2. ZEP_USE_LOCAL=true: 使用本地 Neo4j + Qdrant (zep_adapter)
+
 核心检索工具（优化后）：
 1. InsightForge（深度洞察检索）- 最强大的混合检索，自动生成子问题并多维度检索
 2. PanoramaSearch（广度搜索）- 获取全貌，包括过期内容
@@ -13,13 +17,29 @@ import json
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass, field
 
-from zep_cloud.client import Zep
-
 from ..config import Config
 from ..utils.logger import get_logger
 from ..utils.llm_client import LLMClient
 
 logger = get_logger('mirofish.zep_tools')
+
+# 根据配置选择使用 Zep Cloud 或本地适配器
+if Config.ZEP_USE_LOCAL:
+    from .zep_adapter import (
+        ZepClient as Zep,
+        ZepToolsServiceLocal,
+        SearchResult,
+        NodeInfo,
+        EdgeInfo,
+        InsightForgeResult,
+        PanoramaResult,
+        AgentInterview,
+        InterviewResult,
+    )
+    logger.info("使用 Zep 本地适配器 (Neo4j + Qdrant)")
+else:
+    from zep_cloud.client import Zep
+    logger.info("使用 Zep Cloud")
 
 
 @dataclass
@@ -377,13 +397,13 @@ class InterviewResult:
 class ZepToolsService:
     """
     Zep检索工具服务
-    
+
     【核心检索工具 - 优化后】
     1. insight_forge - 深度洞察检索（最强大，自动生成子问题，多维度检索）
     2. panorama_search - 广度搜索（获取全貌，包括过期内容）
     3. quick_search - 简单搜索（快速检索）
     4. interview_agents - 深度采访（采访模拟Agent，获取多视角观点）
-    
+
     【基础工具】
     - search_graph - 图谱语义搜索
     - get_all_nodes - 获取图谱所有节点
@@ -393,20 +413,135 @@ class ZepToolsService:
     - get_entities_by_type - 按类型获取实体
     - get_entity_summary - 获取实体的关系摘要
     """
-    
+
     # 重试配置
     MAX_RETRIES = 3
     RETRY_DELAY = 2.0
-    
+
     def __init__(self, api_key: Optional[str] = None, llm_client: Optional[LLMClient] = None):
         self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = Zep(api_key=self.api_key)
-        # LLM客户端用于InsightForge生成子问题
         self._llm_client = llm_client
-        logger.info("ZepToolsService 初始化完成")
+
+        # 根据配置选择使用 Zep Cloud 或本地适配器
+        if Config.ZEP_USE_LOCAL:
+            # 本地模式使用 ZepClient 适配器
+            from .zep_adapter import ZepClient, ZepToolsServiceLocal
+            self.client = ZepClient()
+            # 使用本地服务实现
+            self._local_service = ZepToolsServiceLocal(client=self.client, llm_client=llm_client)
+            self._use_local = True
+            logger.info("ZepToolsService 初始化完成 (本地模式)")
+        else:
+            # 云端模式使用原始 Zep SDK
+            if not self.api_key:
+                raise ValueError("ZEP_API_KEY 未配置")
+            self.client = Zep(api_key=self.api_key)
+            self._use_local = False
+            logger.info("ZepToolsService 初始化完成 (云端模式)")
+
+    # ========== 本地模式代理方法 ==========
+
+    def search_graph(self, graph_id: str, query: str, limit: int = 10, scope: str = "edges") -> SearchResult:
+        """图谱语义搜索"""
+        if self._use_local:
+            return self._local_service.search_graph(graph_id, query, limit, scope)
+        return self._search_graph_cloud_impl(graph_id, query, limit, scope)
+
+    def get_all_nodes(self, graph_id: str) -> List[NodeInfo]:
+        """获取图谱的所有节点"""
+        if self._use_local:
+            return self._local_service.get_all_nodes(graph_id)
+        return self._get_all_nodes_cloud_impl(graph_id)
+
+    def get_all_edges(self, graph_id: str, include_temporal: bool = True) -> List[EdgeInfo]:
+        """获取图谱的所有边"""
+        if self._use_local:
+            return self._local_service.get_all_edges(graph_id, include_temporal)
+        return self._get_all_edges_cloud_impl(graph_id, include_temporal)
+
+    def get_node_detail(self, node_uuid: str) -> Optional[NodeInfo]:
+        """获取节点详情"""
+        if self._use_local:
+            return self._local_service.get_node_detail(node_uuid)
+        return self._get_node_detail_cloud_impl(node_uuid)
+
+    def get_node_edges(self, graph_id: str, node_uuid: str) -> List[EdgeInfo]:
+        """获取节点边"""
+        if self._use_local:
+            return self._local_service.get_node_edges(graph_id, node_uuid)
+        return self._get_node_edges_cloud_impl(graph_id, node_uuid)
+
+    def get_entities_by_type(self, graph_id: str, entity_type: str) -> List[NodeInfo]:
+        """按类型获取实体"""
+        if self._use_local:
+            return self._local_service.get_entities_by_type(graph_id, entity_type)
+        return self._get_entities_by_type_cloud_impl(graph_id, entity_type)
+
+    def get_entity_summary(self, graph_id: str, entity_name: str) -> Dict[str, Any]:
+        """获取实体摘要"""
+        if self._use_local:
+            return self._local_service.get_entity_summary(graph_id, entity_name)
+        return self._get_entity_summary_cloud_impl(graph_id, entity_name)
+
+    def get_graph_statistics(self, graph_id: str) -> Dict[str, Any]:
+        """获取图谱统计"""
+        if self._use_local:
+            return self._local_service.get_graph_statistics(graph_id)
+        return self._get_graph_statistics_cloud_impl(graph_id)
+
+    def get_simulation_context(self, graph_id: str, simulation_requirement: str, limit: int = 30) -> Dict[str, Any]:
+        """获取模拟上下文"""
+        if self._use_local:
+            # 本地模式的简化实现
+            search_result = self.search_graph(graph_id, simulation_requirement, limit)
+            stats = self.get_graph_statistics(graph_id)
+            all_nodes = self.get_all_nodes(graph_id)
+            entities = []
+            for node in all_nodes:
+                custom_labels = [l for l in node.labels if l not in ["Entity", "Node"]]
+                if custom_labels:
+                    entities.append({
+                        "name": node.name,
+                        "type": custom_labels[0],
+                        "summary": node.summary
+                    })
+            return {
+                "simulation_requirement": simulation_requirement,
+                "related_facts": search_result.facts,
+                "graph_statistics": stats,
+                "entities": entities[:limit],
+                "total_entities": len(entities)
+            }
+        return self._get_simulation_context_cloud_impl(graph_id, simulation_requirement, limit)
+
+    def insight_forge(self, graph_id: str, query: str, simulation_requirement: str,
+                      report_context: str = "", max_sub_queries: int = 5) -> InsightForgeResult:
+        """深度洞察检索"""
+        if self._use_local:
+            return self._local_service.insight_forge(graph_id, query, simulation_requirement, report_context, max_sub_queries)
+        return self._insight_forge_cloud_impl(graph_id, query, simulation_requirement, report_context, max_sub_queries)
+
+    def panorama_search(self, graph_id: str, query: str, include_expired: bool = True, limit: int = 50) -> PanoramaResult:
+        """广度搜索"""
+        if self._use_local:
+            return self._local_service.panorama_search(graph_id, query, include_expired, limit)
+        return self._panorama_search_cloud_impl(graph_id, query, include_expired, limit)
+
+    def quick_search(self, graph_id: str, query: str, limit: int = 10) -> SearchResult:
+        """简单搜索"""
+        if self._use_local:
+            return self._local_service.quick_search(graph_id, query, limit)
+        return self._quick_search_cloud_impl(graph_id, query, limit)
+
+    def interview_agents(self, simulation_id: str, interview_requirement: str,
+                         simulation_requirement: str = "", max_agents: int = 5,
+                         custom_questions: List[str] = None) -> InterviewResult:
+        """深度采访（两种模式都使用云端实现，因为它需要调用 OASIS API）"""
+        # interview_agents 功能直接使用云端实现，因为它主要调用 OASIS API
+        return self._interview_agents_cloud_impl(simulation_id, interview_requirement,
+                                                  simulation_requirement, max_agents, custom_questions)
+
+    # ========== 云端模式原始方法 (重命名以避免冲突) ==========
     
     @property
     def llm(self) -> LLMClient:
@@ -438,30 +573,30 @@ class ZepToolsService:
         
         raise last_exception
     
-    def search_graph(
-        self, 
-        graph_id: str, 
-        query: str, 
+    def _search_graph_cloud_impl(
+        self,
+        graph_id: str,
+        query: str,
         limit: int = 10,
         scope: str = "edges"
     ) -> SearchResult:
         """
-        图谱语义搜索
-        
+        图谱语义搜索 (云端模式)
+
         使用混合搜索（语义+BM25）在图谱中搜索相关信息。
         如果Zep Cloud的search API不可用，则降级为本地关键词匹配。
-        
+
         Args:
             graph_id: 图谱ID (Standalone Graph)
             query: 搜索查询
             limit: 返回结果数量
             scope: 搜索范围，"edges" 或 "nodes"
-            
+
         Returns:
             SearchResult: 搜索结果
         """
-        logger.info(f"图谱搜索: graph_id={graph_id}, query={query[:50]}...")
-        
+        logger.info(f"图谱搜索(云端): graph_id={graph_id}, query={query[:50]}...")
+
         # 尝试使用Zep Cloud Search API
         try:
             search_results = self._call_with_retry(
@@ -474,11 +609,11 @@ class ZepToolsService:
                 ),
                 operation_name=f"图谱搜索(graph={graph_id})"
             )
-            
+
             facts = []
             edges = []
             nodes = []
-            
+
             # 解析边搜索结果
             if hasattr(search_results, 'edges') and search_results.edges:
                 for edge in search_results.edges:
@@ -491,7 +626,7 @@ class ZepToolsService:
                         "source_node_uuid": getattr(edge, 'source_node_uuid', ''),
                         "target_node_uuid": getattr(edge, 'target_node_uuid', ''),
                     })
-            
+
             # 解析节点搜索结果
             if hasattr(search_results, 'nodes') and search_results.nodes:
                 for node in search_results.nodes:
@@ -504,9 +639,9 @@ class ZepToolsService:
                     # 节点摘要也算作事实
                     if hasattr(node, 'summary') and node.summary:
                         facts.append(f"[{node.name}]: {node.summary}")
-            
+
             logger.info(f"搜索完成: 找到 {len(facts)} 条相关事实")
-            
+
             return SearchResult(
                 facts=facts,
                 edges=edges,
@@ -514,7 +649,7 @@ class ZepToolsService:
                 query=query,
                 total_count=len(facts)
             )
-            
+
         except Exception as e:
             logger.warning(f"Zep Search API失败，降级为本地搜索: {str(e)}")
             # 降级：使用本地关键词匹配搜索
@@ -624,7 +759,7 @@ class ZepToolsService:
             total_count=len(facts)
         )
     
-    def get_all_nodes(self, graph_id: str) -> List[NodeInfo]:
+    def _get_all_nodes_cloud_impl(self, graph_id: str) -> List[NodeInfo]:
         """
         获取图谱的所有节点
         
@@ -654,7 +789,7 @@ class ZepToolsService:
         logger.info(f"获取到 {len(result)} 个节点")
         return result
     
-    def get_all_edges(self, graph_id: str, include_temporal: bool = True) -> List[EdgeInfo]:
+    def _get_all_edges_cloud_impl(self, graph_id: str, include_temporal: bool = True) -> List[EdgeInfo]:
         """
         获取图谱的所有边（包含时间信息）
         
@@ -694,7 +829,7 @@ class ZepToolsService:
         logger.info(f"获取到 {len(result)} 条边")
         return result
     
-    def get_node_detail(self, node_uuid: str) -> Optional[NodeInfo]:
+    def _get_node_detail_cloud_impl(self, node_uuid: str) -> Optional[NodeInfo]:
         """
         获取单个节点的详细信息
         
@@ -726,7 +861,7 @@ class ZepToolsService:
             logger.error(f"获取节点详情失败: {str(e)}")
             return None
     
-    def get_node_edges(self, graph_id: str, node_uuid: str) -> List[EdgeInfo]:
+    def _get_node_edges_cloud_impl(self, graph_id: str, node_uuid: str) -> List[EdgeInfo]:
         """
         获取节点相关的所有边
         
@@ -758,7 +893,7 @@ class ZepToolsService:
             logger.warning(f"获取节点边失败: {str(e)}")
             return []
     
-    def get_entities_by_type(
+    def _get_entities_by_type_cloud_impl(
         self, 
         graph_id: str, 
         entity_type: str
@@ -786,7 +921,7 @@ class ZepToolsService:
         logger.info(f"找到 {len(filtered)} 个 {entity_type} 类型的实体")
         return filtered
     
-    def get_entity_summary(
+    def _get_entity_summary_cloud_impl(
         self, 
         graph_id: str, 
         entity_name: str
@@ -833,7 +968,7 @@ class ZepToolsService:
             "total_relations": len(related_edges)
         }
     
-    def get_graph_statistics(self, graph_id: str) -> Dict[str, Any]:
+    def _get_graph_statistics_cloud_impl(self, graph_id: str) -> Dict[str, Any]:
         """
         获取图谱的统计信息
         
@@ -868,7 +1003,7 @@ class ZepToolsService:
             "relation_types": relation_types
         }
     
-    def get_simulation_context(
+    def _get_simulation_context_cloud_impl(
         self, 
         graph_id: str,
         simulation_requirement: str,
@@ -923,7 +1058,7 @@ class ZepToolsService:
     
     # ========== 核心检索工具（优化后） ==========
     
-    def insight_forge(
+    def _insight_forge_cloud_impl(
         self,
         graph_id: str,
         query: str,
@@ -1123,7 +1258,7 @@ class ZepToolsService:
                 f"{query} 的发展过程"
             ][:max_queries]
     
-    def panorama_search(
+    def _panorama_search_cloud_impl(
         self,
         graph_id: str,
         query: str,
@@ -1215,7 +1350,7 @@ class ZepToolsService:
         logger.info(f"PanoramaSearch完成: {result.active_count}条有效, {result.historical_count}条历史")
         return result
     
-    def quick_search(
+    def _quick_search_cloud_impl(
         self,
         graph_id: str,
         query: str,
@@ -1250,7 +1385,7 @@ class ZepToolsService:
         logger.info(f"QuickSearch完成: {result.total_count}条结果")
         return result
     
-    def interview_agents(
+    def _interview_agents_cloud_impl(
         self,
         simulation_id: str,
         interview_requirement: str,

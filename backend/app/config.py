@@ -21,7 +21,10 @@ class Config:
     """Flask配置类"""
     
     # Flask配置
-    SECRET_KEY = os.environ.get('SECRET_KEY', 'mirofish-secret-key')
+    SECRET_KEY = os.environ.get('SECRET_KEY')
+    if not SECRET_KEY:
+        import secrets
+        SECRET_KEY = secrets.token_hex(32)
     DEBUG = os.environ.get('FLASK_DEBUG', 'True').lower() == 'true'
     
     # JSON配置 - 禁用ASCII转义，让中文直接显示（而不是 \uXXXX 格式）
@@ -34,7 +37,21 @@ class Config:
     
     # Zep配置
     ZEP_API_KEY = os.environ.get('ZEP_API_KEY')
-    
+
+    # Zep 本地模式配置 (使用 Neo4j + Qdrant 替代 Zep Cloud)
+    ZEP_USE_LOCAL = os.environ.get('ZEP_USE_LOCAL', 'false').lower() == 'true'
+
+    # Neo4j 配置 (本地模式)
+    NEO4J_URI = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
+    NEO4J_USERNAME = os.environ.get('NEO4J_USERNAME', 'neo4j')
+    NEO4J_PASSWORD = os.environ.get('NEO4J_PASSWORD')  # 必须显式配置
+
+    # Qdrant 配置 (本地模式)
+    QDRANT_URL = os.environ.get('QDRANT_URL', 'http://localhost:6333')
+
+    # Embedding 模型配置 (本地模式)
+    EMBEDDING_MODEL = os.environ.get('EMBEDDING_MODEL', 'text-embedding-3-small')
+
     # 文件上传配置
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
     UPLOAD_FOLDER = os.path.join(os.path.dirname(__file__), '../uploads')
@@ -69,7 +86,14 @@ class Config:
         errors = []
         if not cls.LLM_API_KEY:
             errors.append("LLM_API_KEY 未配置")
-        if not cls.ZEP_API_KEY:
-            errors.append("ZEP_API_KEY 未配置")
+
+        # 根据模式验证不同的配置
+        if cls.ZEP_USE_LOCAL:
+            if not cls.NEO4J_PASSWORD:
+                errors.append("NEO4J_PASSWORD 未配置 (本地模式需要)")
+        else:
+            if not cls.ZEP_API_KEY:
+                errors.append("ZEP_API_KEY 未配置 (云端模式需要)")
+
         return errors
 

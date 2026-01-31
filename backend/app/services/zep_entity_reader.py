@@ -1,13 +1,15 @@
 """
 Zep实体读取与过滤服务
 从Zep图谱中读取节点，筛选出符合预定义实体类型的节点
+
+支持两种模式:
+1. ZEP_USE_LOCAL=false: 使用 Zep Cloud (zep_cloud.client.Zep)
+2. ZEP_USE_LOCAL=true: 使用本地 Neo4j + Qdrant (zep_adapter)
 """
 
 import time
 from typing import Dict, Any, List, Optional, Set, Callable, TypeVar
 from dataclasses import dataclass, field
-
-from zep_cloud.client import Zep
 
 from ..config import Config
 from ..utils.logger import get_logger
@@ -16,6 +18,14 @@ logger = get_logger('mirofish.zep_entity_reader')
 
 # 用于泛型返回类型
 T = TypeVar('T')
+
+# 根据配置选择使用 Zep Cloud 或本地适配器
+if Config.ZEP_USE_LOCAL:
+    from .zep_adapter import ZepClient, ZepEntityReaderLocal, FilteredEntities
+    logger.info("使用 Zep 本地适配器 (Neo4j + Qdrant) for entity reader")
+else:
+    from zep_cloud.client import Zep
+    logger.info("使用 Zep Cloud for entity reader")
 
 
 @dataclass
@@ -70,19 +80,30 @@ class FilteredEntities:
 class ZepEntityReader:
     """
     Zep实体读取与过滤服务
-    
+
     主要功能：
     1. 从Zep图谱读取所有节点
     2. 筛选出符合预定义实体类型的节点（Labels不只是Entity的节点）
     3. 获取每个实体的相关边和关联节点信息
     """
-    
+
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = Zep(api_key=self.api_key)
+        self._use_local = Config.ZEP_USE_LOCAL
+
+        if self._use_local:
+            # 本地模式使用 ZepClient 适配器
+            from .zep_adapter import ZepClient, ZepEntityReaderLocal
+            self.client = ZepClient()
+            self._local_reader = ZepEntityReaderLocal(client=self.client)
+        else:
+            # 云端模式使用原始 Zep SDK
+            if not self.api_key:
+                raise ValueError("ZEP_API_KEY 未配置")
+            self.client = Zep(api_key=self.api_key)
+
+        mode_str = "本地模式" if self._use_local else "云端模式"
+        logger.info(f"ZepEntityReader 初始化完成 ({mode_str})")
     
     def _call_with_retry(
         self, 
@@ -92,20 +113,20 @@ class ZepEntityReader:
         initial_delay: float = 2.0
     ) -> T:
         """
-        带重试机制的Zep API调用
-        
+        带重试机制的Zep API调用 (云端模式)
+
         Args:
             func: 要执行的函数（无参数的lambda或callable）
             operation_name: 操作名称，用于日志
             max_retries: 最大重试次数（默认3次，即最多尝试3次）
             initial_delay: 初始延迟秒数
-            
+
         Returns:
             API调用结果
         """
         last_exception = None
         delay = initial_delay
-        
+
         for attempt in range(max_retries):
             try:
                 return func()
@@ -120,10 +141,64 @@ class ZepEntityReader:
                     delay *= 2  # 指数退避
                 else:
                     logger.error(f"Zep {operation_name} 在 {max_retries} 次尝试后仍失败: {str(e)}")
-        
+
         raise last_exception
-    
+
+    # ========== 本地模式代理方法 ==========
+
     def get_all_nodes(self, graph_id: str) -> List[Dict[str, Any]]:
+        """获取图谱的所有节点"""
+        if self._use_local:
+            return self._local_reader.get_all_nodes(graph_id)
+        return self._get_all_nodes_cloud_impl(graph_id)
+
+    def get_all_edges(self, graph_id: str) -> List[Dict[str, Any]]:
+        """获取图谱的所有边"""
+        if self._use_local:
+            return self._local_reader.get_all_edges(graph_id)
+        return self._get_all_edges_cloud_impl(graph_id)
+
+    def get_node_edges(self, node_uuid: str) -> List[Dict[str, Any]]:
+        """获取节点的边"""
+        if self._use_local:
+            return self._local_reader.get_node_edges(node_uuid)
+        return self._get_node_edges_cloud_impl(node_uuid)
+
+    def filter_defined_entities(
+        self,
+        graph_id: str,
+        defined_entity_types: Optional[List[str]] = None,
+        enrich_with_edges: bool = True
+    ) -> FilteredEntities:
+        """筛选实体"""
+        if self._use_local:
+            return self._local_reader.filter_defined_entities(graph_id, defined_entity_types, enrich_with_edges)
+        return self._filter_defined_entities_cloud_impl(graph_id, defined_entity_types, enrich_with_edges)
+
+    def get_entity_with_context(
+        self,
+        graph_id: str,
+        entity_uuid: str
+    ) -> Optional[EntityNode]:
+        """获取实体及上下文"""
+        if self._use_local:
+            return self._local_reader.get_entity_with_context(graph_id, entity_uuid)
+        return self._get_entity_with_context_cloud_impl(graph_id, entity_uuid)
+
+    def get_entities_by_type(
+        self,
+        graph_id: str,
+        entity_type: str,
+        enrich_with_edges: bool = True
+    ) -> List[EntityNode]:
+        """按类型获取实体"""
+        if self._use_local:
+            return self._local_reader.get_entities_by_type(graph_id, entity_type, enrich_with_edges)
+        return self._get_entities_by_type_cloud_impl(graph_id, entity_type, enrich_with_edges)
+
+    # ========== 云端模式实现 (_cloud_impl 后缀) ==========
+
+    def _get_all_nodes_cloud_impl(self, graph_id: str) -> List[Dict[str, Any]]:
         """
         获取图谱的所有节点（带重试机制）
         
@@ -154,7 +229,7 @@ class ZepEntityReader:
         logger.info(f"共获取 {len(nodes_data)} 个节点")
         return nodes_data
     
-    def get_all_edges(self, graph_id: str) -> List[Dict[str, Any]]:
+    def _get_all_edges_cloud_impl(self, graph_id: str) -> List[Dict[str, Any]]:
         """
         获取图谱的所有边（带重试机制）
         
@@ -186,7 +261,7 @@ class ZepEntityReader:
         logger.info(f"共获取 {len(edges_data)} 条边")
         return edges_data
     
-    def get_node_edges(self, node_uuid: str) -> List[Dict[str, Any]]:
+    def _get_node_edges_cloud_impl(self, node_uuid: str) -> List[Dict[str, Any]]:
         """
         获取指定节点的所有相关边（带重试机制）
         
@@ -219,7 +294,7 @@ class ZepEntityReader:
             logger.warning(f"获取节点 {node_uuid} 的边失败: {str(e)}")
             return []
     
-    def filter_defined_entities(
+    def _filter_defined_entities_cloud_impl(
         self, 
         graph_id: str,
         defined_entity_types: Optional[List[str]] = None,
@@ -337,7 +412,7 @@ class ZepEntityReader:
             filtered_count=len(filtered_entities),
         )
     
-    def get_entity_with_context(
+    def _get_entity_with_context_cloud_impl(
         self, 
         graph_id: str, 
         entity_uuid: str
@@ -417,7 +492,7 @@ class ZepEntityReader:
             logger.error(f"获取实体 {entity_uuid} 失败: {str(e)}")
             return None
     
-    def get_entities_by_type(
+    def _get_entities_by_type_cloud_impl(
         self, 
         graph_id: str, 
         entity_type: str,

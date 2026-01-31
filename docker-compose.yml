@@ -12,3 +12,59 @@ services:
     restart: unless-stopped
     volumes:
       - ./backend/uploads:/app/backend/uploads
+    depends_on:
+      - neo4j
+      - qdrant
+    networks:
+      - mirofish-network
+
+  # Neo4j 图数据库 (本地 Zep 替代方案)
+  neo4j:
+    image: neo4j:5.25-community
+    container_name: mirofish-neo4j
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD:-mirofish123}
+      - NEO4J_PLUGINS=["apoc"]
+      - NEO4J_dbms_memory_heap_initial__size=512m
+      - NEO4J_dbms_memory_heap_max__size=1G
+    ports:
+      - "7474:7474"  # HTTP
+      - "7687:7687"  # Bolt
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    restart: unless-stopped
+    networks:
+      - mirofish-network
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:-mirofish123}", "RETURN 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Qdrant 向量数据库 (本地 Zep 语义搜索替代方案)
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: mirofish-qdrant
+    ports:
+      - "6333:6333"  # HTTP
+      - "6334:6334"  # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+    networks:
+      - mirofish-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+networks:
+  mirofish-network:
+    driver: bridge
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  qdrant_data:
