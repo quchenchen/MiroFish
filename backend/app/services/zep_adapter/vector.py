@@ -42,11 +42,13 @@ class EmbeddingService:
         """
         self.api_key = api_key or Config.LLM_API_KEY
         self.base_url = base_url or Config.LLM_BASE_URL
-        self.model = model or getattr(Config, 'EMBEDDING_MODEL', 'text-embedding-3-small')
+        # 从配置获取模型，阿里云使用 text-embedding-v3
+        self.model = model or getattr(Config, 'EMBEDDING_MODEL', 'text-embedding-v3')
 
         self.client = OpenAI(
             api_key=self.api_key,
-            base_url=self.base_url
+            base_url=self.base_url,
+            timeout=60.0  # 增加超时时间以支持阿里云 API
         )
 
         logger.info(f"EmbeddingService 初始化完成: model={self.model}")
@@ -69,8 +71,9 @@ class EmbeddingService:
             return response.data[0].embedding
         except Exception as e:
             logger.error(f"生成嵌入失败: {e}")
-            # 返回零向量作为降级方案
-            return [0.0] * 1536
+            # 返回零向量作为降级方案 (根据模型维度)
+            dim = 1024 if "text-embedding-v3" in self.model or "embedding-v" in self.model else 1536
+            return [0.0] * dim
 
     def embed_batch(self, texts: List[str]) -> List[List[float]]:
         """
@@ -90,7 +93,8 @@ class EmbeddingService:
             return [item.embedding for item in response.data]
         except Exception as e:
             logger.error(f"批量生成嵌入失败: {e}")
-            return [[0.0] * 1536 for _ in texts]
+            dim = 1024 if "text-embedding-v3" in self.model or "embedding-v" in self.model else 1536
+            return [[0.0] * dim for _ in texts]
 
 
 class QdrantVectorService:
@@ -100,8 +104,10 @@ class QdrantVectorService:
     提供向量存储和语义搜索功能
     """
 
-    # 向量维度 (OpenAI text-embedding-3-small 默认 1536)
-    VECTOR_SIZE = 1536
+    # 向量维度 (根据 embedding 模型自动调整)
+    # OpenAI text-embedding-3-small: 1536
+    # 阿里云 text-embedding-v3: 1024
+    VECTOR_SIZE = 1536  # 默认值，实际使用时会根据模型调整
 
     def __init__(
         self,
@@ -123,7 +129,8 @@ class QdrantVectorService:
         self.client = QdrantClient(
             url=self.url,
             api_key=self.api_key,
-            timeout=30
+            timeout=30,
+            check_compatibility=False  # 禁用版本兼容性检查
         )
 
         self.embedding = embedding_service or EmbeddingService()
@@ -162,17 +169,31 @@ class QdrantVectorService:
         collection_names = [c.name for c in collections]
 
         if collection_name not in collection_names:
+            # 动态获取向量维度
+            vector_size = self._get_vector_size()
             # 创建新集合
             self.client.create_collection(
                 collection_name=collection_name,
                 vectors_config=VectorParams(
-                    size=self.VECTOR_SIZE,
+                    size=vector_size,
                     distance=Distance.COSINE
                 )
             )
-            logger.info(f"创建 Qdrant 集合: {collection_name}")
+            logger.info(f"创建 Qdrant 集合: {collection_name} (维度: {vector_size})")
 
         return collection_name
+
+    def _get_vector_size(self) -> int:
+        """获取当前 embedding 模型的向量维度"""
+        model = self.embedding.model
+        if "text-embedding-v3" in model or "embedding-v" in model:
+            return 1024
+        elif "text-embedding-3-large" in model:
+            return 3072
+        elif "text-embedding-3-small" in model:
+            return 1536
+        else:
+            return 1536  # 默认
 
     def upsert_edge(
         self,
@@ -370,18 +391,17 @@ class QdrantVectorService:
             if conditions:
                 query_filter = Filter(must=conditions)
 
-        # 执行搜索
+        # 执行搜索 (使用 query_points 推荐)
         try:
-            results = self.client.search(
+            results = self.client.query_points(
                 collection_name=collection_name,
-                query_vector=query_vector,
-                limit=limit,
-                query_filter=query_filter
+                query=query_vector,  # 参数名是 query 不是 query_vector
+                limit=limit
             )
 
-            # 格式化结果
+            # 格式化结果 (query_points 返回 QueryResponse，包含 points 列表)
             formatted_results = []
-            for result in results:
+            for result in results.points:  # 访问 response.points
                 formatted_results.append({
                     "uuid": result.id,
                     "text": result.payload.get("text", ""),

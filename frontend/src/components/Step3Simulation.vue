@@ -91,13 +91,24 @@
       </div>
 
       <div class="action-controls">
-        <button 
+        <!-- 重置状态按钮（仅在启动失败且状态为 paused/stopped/completed 时显示） -->
+        <button
+          v-if="showResetButton"
+          class="action-btn warning"
+          :disabled="isResettingStatus"
+          @click="handleResetStatus"
+        >
+          <span v-if="isResettingStatus" class="loading-spinner-small"></span>
+          {{ isResettingStatus ? '重置中...' : `重置状态 (${simulationStatus})` }}
+        </button>
+
+        <button
           class="action-btn primary"
           :disabled="phase !== 2 || isGeneratingReport"
           @click="handleNextStep"
         >
           <span v-if="isGeneratingReport" class="loading-spinner-small"></span>
-          {{ isGeneratingReport ? '启动中...' : '开始生成结果报告' }} 
+          {{ isGeneratingReport ? '启动中...' : '开始生成结果报告' }}
           <span v-if="!isGeneratingReport" class="arrow-icon">→</span>
         </button>
       </div>
@@ -288,10 +299,12 @@
 <script setup>
 import { ref, computed, watch, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
-import { 
-  startSimulation, 
+import {
+  startSimulation,
   stopSimulation,
-  getRunStatus, 
+  getSimulation,
+  updateSimulationStatus,
+  getRunStatus,
   getRunStatusDetail
 } from '../api/simulation'
 import { generateReport } from '../api/report'
@@ -319,6 +332,8 @@ const isStarting = ref(false)
 const isStopping = ref(false)
 const startError = ref(null)
 const runStatus = ref({})
+const simulationStatus = ref(null) // 模拟状态（ready/paused/stopped/completed）
+const isResettingStatus = ref(false)
 const allActions = ref([]) // 所有动作（增量累积）
 const actionIds = ref(new Set()) // 用于去重的动作ID集合
 const scrollContainer = ref(null)
@@ -428,11 +443,64 @@ const doStartSimulation = async () => {
   } catch (err) {
     startError.value = err.message
     addLog(`✗ 启动异常: ${err.message}`)
+    // 获取模拟状态以便提供重置选项
+    fetchSimulationStatus()
     emit('update-status', 'error')
   } finally {
     isStarting.value = false
   }
 }
+
+// 获取模拟状态
+const fetchSimulationStatus = async () => {
+  if (!props.simulationId) return
+
+  try {
+    const res = await getSimulation(props.simulationId)
+    if (res.success && res.data) {
+      simulationStatus.value = res.data.status
+    }
+  } catch (err) {
+    console.warn('获取模拟状态失败:', err)
+  }
+}
+
+// 重置模拟状态为 ready
+const handleResetStatus = async () => {
+  if (!props.simulationId) return
+
+  isResettingStatus.value = true
+  addLog('正在重置模拟状态...')
+
+  try {
+    const res = await updateSimulationStatus({
+      simulation_id: props.simulationId,
+      status: 'ready'
+    })
+
+    if (res.success) {
+      addLog(`✓ 状态已更新: ${res.data.old_status} -> ${res.data.new_status}`)
+      simulationStatus.value = 'ready'
+      startError.value = null
+
+      // 自动重新启动
+      addLog('正在重新启动模拟...')
+      await doStartSimulation()
+    } else {
+      addLog(`✗ 状态更新失败: ${res.error || '未知错误'}`)
+    }
+  } catch (err) {
+    addLog(`✗ 状态更新异常: ${err.message}`)
+  } finally {
+    isResettingStatus.value = false
+  }
+}
+
+// 是否需要显示重置状态按钮
+const showResetButton = computed(() => {
+  return startError.value && simulationStatus.value &&
+         ['paused', 'stopped', 'completed'].includes(simulationStatus.value)
+})
 
 // 停止模拟
 const handleStopSimulation = async () => {
@@ -891,6 +959,16 @@ onUnmounted(() => {
 
 .action-btn.primary:hover:not(:disabled) {
   background: #333;
+}
+
+.action-btn.warning {
+  background: #FFF;
+  color: #F59E0B;
+  border: 1px solid #F59E0B;
+}
+
+.action-btn.warning:hover:not(:disabled) {
+  background: #FFFBEB;
 }
 
 .action-btn:disabled {

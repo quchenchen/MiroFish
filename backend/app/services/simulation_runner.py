@@ -315,18 +315,20 @@ class SimulationRunner:
         platform: str = "parallel",  # twitter / reddit / parallel
         max_rounds: int = None,  # 最大模拟轮数（可选，用于截断过长的模拟）
         enable_graph_memory_update: bool = False,  # 是否将活动更新到Zep图谱
-        graph_id: str = None  # Zep图谱ID（启用图谱更新时必需）
+        graph_id: str = None,  # Zep图谱ID（启用图谱更新时必需）
+        project_id: str = None  # 项目ID（用于获取本体进行实体抽取）
     ) -> SimulationRunState:
         """
         启动模拟
-        
+
         Args:
             simulation_id: 模拟ID
             platform: 运行平台 (twitter/reddit/parallel)
             max_rounds: 最大模拟轮数（可选，用于截断过长的模拟）
             enable_graph_memory_update: 是否将Agent活动动态更新到Zep图谱
             graph_id: Zep图谱ID（启用图谱更新时必需）
-            
+            project_id: 项目ID（用于获取本体进行实体抽取）
+
         Returns:
             SimulationRunState
         """
@@ -372,11 +374,16 @@ class SimulationRunner:
         if enable_graph_memory_update:
             if not graph_id:
                 raise ValueError("启用图谱记忆更新时必须提供 graph_id")
-            
+
             try:
-                ZepGraphMemoryManager.create_updater(simulation_id, graph_id)
+                ZepGraphMemoryManager.create_updater(
+                    simulation_id=simulation_id,
+                    graph_id=graph_id,
+                    project_id=project_id,  # 传递项目ID用于获取本体
+                    enable_entity_extraction=True  # 启用实时实体抽取
+                )
                 cls._graph_memory_enabled[simulation_id] = True
-                logger.info(f"已启用图谱记忆更新: simulation_id={simulation_id}, graph_id={graph_id}")
+                logger.info(f"已启用图谱记忆更新: simulation_id={simulation_id}, graph_id={graph_id}, project_id={project_id}")
             except Exception as e:
                 logger.error(f"创建图谱记忆更新器失败: {e}")
                 cls._graph_memory_enabled[simulation_id] = False
@@ -412,12 +419,30 @@ class SimulationRunner:
             #   reddit/actions.jsonl  - Reddit 动作日志
             #   simulation.log        - 主进程日志
             
+            # 获取用于运行模拟的 Python 解释器
+            # camel-ai 需要 Python 3.12（默认），可通过环境变量 SIMULATION_PYTHON 配置
+            simulation_python = Config.SIMULATION_PYTHON
+
+            # 检查 Python 解释器是否可用
+            try:
+                subprocess.run(
+                    [simulation_python, "--version"],
+                    capture_output=True,
+                    check=True,
+                    timeout=5
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired) as e:
+                logger.warning(f"配置的 Python 解释器 '{simulation_python}' 不可用: {e}")
+                logger.info(f"回退到 sys.executable: {sys.executable}")
+                simulation_python = sys.executable
+
             cmd = [
-                sys.executable,  # Python解释器
+                simulation_python,  # Python解释器（camel-ai 需要 Python 3.12）
                 script_path,
                 "--config", config_path,  # 使用完整配置文件路径
+                "--no-wait",  # 不进入等待命令模式，自动运行模拟
             ]
-            
+
             # 如果指定了最大轮数，添加到命令行参数
             if max_rounds is not None and max_rounds > 0:
                 cmd.extend(["--max-rounds", str(max_rounds)])

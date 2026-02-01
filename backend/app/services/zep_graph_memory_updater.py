@@ -233,22 +233,36 @@ class ZepGraphMemoryUpdater:
     
     # 发送间隔（秒），避免请求过快
     SEND_INTERVAL = 0.5
-    
+
+    # 实体抽取配置
+    ENABLE_ENTITY_EXTRACTION = True  # 默认启用实体抽取
+    ENTITY_EXTRACTION_INTERVAL = 3   # 每N批活动后进行一次实体抽取（避免频繁调用LLM）
+
     # 重试配置
     MAX_RETRIES = 3
     RETRY_DELAY = 2  # 秒
-    
-    def __init__(self, graph_id: str, api_key: Optional[str] = None):
+
+    def __init__(
+        self,
+        graph_id: str,
+        api_key: Optional[str] = None,
+        ontology: Dict[str, Any] = None,
+        enable_entity_extraction: bool = True
+    ):
         """
         初始化更新器
 
         Args:
             graph_id: Zep图谱ID
             api_key: Zep API Key（可选，默认从配置读取）
+            ontology: 本体定义（用于实体抽取）
+            enable_entity_extraction: 是否启用实时实体抽取
         """
         self.graph_id = graph_id
         self.api_key = api_key or Config.ZEP_API_KEY
         self._use_local = Config.ZEP_USE_LOCAL
+        self.ontology = ontology
+        self._enable_entity_extraction = enable_entity_extraction and self._use_local  # 仅本地模式支持
 
         if self._use_local:
             # 本地模式使用 ZepClient 适配器
@@ -259,6 +273,13 @@ class ZepGraphMemoryUpdater:
             if not self.api_key:
                 raise ValueError("ZEP_API_KEY未配置")
             self.client = Zep(api_key=self.api_key)
+
+        # 实体抽取器（仅本地模式且启用时创建）
+        self._entity_extractor = None
+        if self._enable_entity_extraction:
+            from .entity_extractor import GraphEntityExtractor
+            self._entity_extractor = GraphEntityExtractor()
+            logger.info("实体抽取器已启用，将实时从活动文本中提取实体和关系")
 
         # 活动队列
         self._activity_queue: Queue = Queue()
@@ -280,9 +301,11 @@ class ZepGraphMemoryUpdater:
         self._total_items_sent = 0  # 成功发送到Zep的活动条数
         self._failed_count = 0      # 发送失败的批次数
         self._skipped_count = 0     # 被过滤跳过的活动数（DO_NOTHING）
+        self._extraction_count = 0  # 实体抽取次数
 
         mode_str = "本地模式" if self._use_local else "云端模式"
-        logger.info(f"ZepGraphMemoryUpdater 初始化完成 ({mode_str}): graph_id={graph_id}, batch_size={self.BATCH_SIZE}")
+        extraction_str = f", 实体抽取: {'启用' if self._enable_entity_extraction else '禁用'}" if self._use_local else ""
+        logger.info(f"ZepGraphMemoryUpdater 初始化完成 ({mode_str}): graph_id={graph_id}, batch_size={self.BATCH_SIZE}{extraction_str}")
     
     def _get_platform_display_name(self, platform: str) -> str:
         """获取平台的显示名称"""
@@ -305,19 +328,57 @@ class ZepGraphMemoryUpdater:
     def stop(self):
         """停止后台工作线程"""
         self._running = False
-        
+
         # 发送剩余的活动
         self._flush_remaining()
-        
+
+        # 停止前进行最后一次实体抽取（如果有积累的活动文本）
+        if self._enable_entity_extraction and self._entity_extractor and self._total_sent > 0:
+            try:
+                # 获取最近的文本条目进行抽取
+                from .zep_adapter.graph import Neo4jRepository
+                neo4j = Neo4jRepository()
+                query = """
+                MATCH (t:TextEntry {graph_id: $graph_id})
+                WHERE NOT t.extracted
+                RETURN t.content as content
+                ORDER BY t.created_at DESC
+                LIMIT 10
+                """
+                results = neo4j._execute_query(query, {"graph_id": self.graph_id})
+                if results:
+                    combined = "\n\n".join([r["content"] for r in results if r.get("content")])
+                    if combined:
+                        logger.info("停止前进行最后一次实体抽取...")
+                        result = self._entity_extractor.extract_and_store(
+                            graph_id=self.graph_id,
+                            text=combined,
+                            ontology=self.ontology,
+                            enable_resolution=True
+                        )
+                        self._extraction_count += 1
+                        logger.info(f"最终实体抽取完成: {len(result.entities)} 个实体, {len(result.relations)} 个关系")
+
+                        # 标记为已抽取
+                        mark_query = """
+                        MATCH (t:TextEntry {graph_id: $graph_id})
+                        WHERE NOT t.extracted
+                        SET t.extracted = true
+                        """
+                        neo4j._execute_write(mark_query, {"graph_id": self.graph_id})
+            except Exception as e:
+                logger.warning(f"停止前实体抽取失败: {e}")
+
         if self._worker_thread and self._worker_thread.is_alive():
             self._worker_thread.join(timeout=10)
-        
+
         logger.info(f"ZepGraphMemoryUpdater 已停止: graph_id={self.graph_id}, "
                    f"total_activities={self._total_activities}, "
                    f"batches_sent={self._total_sent}, "
                    f"items_sent={self._total_items_sent}, "
                    f"failed={self._failed_count}, "
-                   f"skipped={self._skipped_count}")
+                   f"skipped={self._skipped_count}, "
+                   f"extractions={self._extraction_count}")
     
     def add_activity(self, activity: AgentActivity):
         """
@@ -407,34 +468,40 @@ class ZepGraphMemoryUpdater:
     def _send_batch_activities(self, activities: List[AgentActivity], platform: str):
         """
         批量发送活动到Zep图谱（合并为一条文本）
-        
+        发送成功后进行实体抽取（如果启用）
+
         Args:
             activities: Agent活动列表
             platform: 平台名称
         """
         if not activities:
             return
-        
+
         # 将多条活动合并为一条文本，用换行分隔
         episode_texts = [activity.to_episode_text() for activity in activities]
         combined_text = "\n".join(episode_texts)
-        
+
         # 带重试的发送
         for attempt in range(self.MAX_RETRIES):
             try:
+                # 使用 type_ 参数名（本地适配器要求）
                 self.client.graph.add(
                     graph_id=self.graph_id,
-                    type="text",
+                    type_="text",
                     data=combined_text
                 )
-                
+
                 self._total_sent += 1
                 self._total_items_sent += len(activities)
                 display_name = self._get_platform_display_name(platform)
                 logger.info(f"成功批量发送 {len(activities)} 条{display_name}活动到图谱 {self.graph_id}")
                 logger.debug(f"批量内容预览: {combined_text[:200]}...")
+
+                # 发送成功后，进行实体抽取（如果启用且达到间隔）
+                self._maybe_extract_entities(combined_text)
+
                 return
-                
+
             except Exception as e:
                 if attempt < self.MAX_RETRIES - 1:
                     logger.warning(f"批量发送到Zep失败 (尝试 {attempt + 1}/{self.MAX_RETRIES}): {e}")
@@ -442,6 +509,34 @@ class ZepGraphMemoryUpdater:
                 else:
                     logger.error(f"批量发送到Zep失败，已重试{self.MAX_RETRIES}次: {e}")
                     self._failed_count += 1
+
+    def _maybe_extract_entities(self, text: str):
+        """
+        条件性地进行实体抽取
+
+        每 N 批活动后进行一次抽取，避免频繁调用 LLM
+
+        Args:
+            text: 待抽取的文本
+        """
+        if not self._enable_entity_extraction or not self._entity_extractor:
+            return
+
+        # 每N批活动后进行一次实体抽取
+        if self._total_sent % self.ENTITY_EXTRACTION_INTERVAL == 0:
+            try:
+                logger.info(f"开始对第 {self._total_sent} 批活动进行实体抽取...")
+                result = self._entity_extractor.extract_and_store(
+                    graph_id=self.graph_id,
+                    text=text,
+                    ontology=self.ontology,
+                    enable_resolution=True
+                )
+                self._extraction_count += 1
+                logger.info(f"实体抽取完成: {len(result.entities)} 个实体, {len(result.relations)} 个关系")
+
+            except Exception as e:
+                logger.warning(f"实体抽取失败（不影响活动记录）: {e}")
     
     def _flush_remaining(self):
         """发送队列和缓冲区中剩余的活动"""
@@ -472,7 +567,7 @@ class ZepGraphMemoryUpdater:
         """获取统计信息"""
         with self._buffer_lock:
             buffer_sizes = {p: len(b) for p, b in self._platform_buffers.items()}
-        
+
         return {
             "graph_id": self.graph_id,
             "batch_size": self.BATCH_SIZE,
@@ -481,6 +576,8 @@ class ZepGraphMemoryUpdater:
             "items_sent": self._total_items_sent,        # 成功发送的活动条数
             "failed_count": self._failed_count,          # 发送失败的批次数
             "skipped_count": self._skipped_count,        # 被过滤跳过的活动数（DO_NOTHING）
+            "extraction_count": self._extraction_count,  # 实体抽取次数
+            "entity_extraction_enabled": self._enable_entity_extraction,  # 实体抽取是否启用
             "queue_size": self._activity_queue.qsize(),
             "buffer_sizes": buffer_sizes,                # 各平台缓冲区大小
             "running": self._running,
@@ -498,28 +595,78 @@ class ZepGraphMemoryManager:
     _lock = threading.Lock()
     
     @classmethod
-    def create_updater(cls, simulation_id: str, graph_id: str) -> ZepGraphMemoryUpdater:
+    def create_updater(
+        cls,
+        simulation_id: str,
+        graph_id: str,
+        ontology: Dict[str, Any] = None,
+        enable_entity_extraction: bool = True,
+        project_id: str = None,
+        max_retries: int = 5,
+        retry_interval: float = 2.0
+    ) -> ZepGraphMemoryUpdater:
         """
         为模拟创建图谱记忆更新器
-        
+
         Args:
             simulation_id: 模拟ID
             graph_id: Zep图谱ID
-            
+            ontology: 本体定义（可选，用于实体抽取）
+            enable_entity_extraction: 是否启用实时实体抽取
+            project_id: 项目ID（用于获取本体）
+            max_retries: 最大重试次数（当Neo4j未就绪时）
+            retry_interval: 重试间隔（秒）
+
         Returns:
             ZepGraphMemoryUpdater实例
         """
+        import time
+
+        # 如果没有提供本体，尝试从项目获取
+        if ontology is None and project_id:
+            try:
+                from ..models.project import ProjectManager
+                project = ProjectManager.get_project(project_id)
+                if project and project.ontology:
+                    ontology = project.ontology
+                    logger.info(f"从项目 {project_id} 获取到本体定义")
+            except Exception as e:
+                logger.warning(f"获取项目本体失败: {e}")
+
         with cls._lock:
             # 如果已存在，先停止旧的
             if simulation_id in cls._updaters:
                 cls._updaters[simulation_id].stop()
-            
-            updater = ZepGraphMemoryUpdater(graph_id)
-            updater.start()
-            cls._updaters[simulation_id] = updater
-            
-            logger.info(f"创建图谱记忆更新器: simulation_id={simulation_id}, graph_id={graph_id}")
-            return updater
+
+            # 尝试创建更新器，如果Neo4j未就绪则重试
+            updater = None
+            last_error = None
+            for attempt in range(max_retries):
+                try:
+                    updater = ZepGraphMemoryUpdater(
+                        graph_id=graph_id,
+                        ontology=ontology,
+                        enable_entity_extraction=enable_entity_extraction
+                    )
+                    updater.start()
+                    break
+                except Exception as e:
+                    last_error = e
+                    if attempt < max_retries - 1:
+                        logger.warning(f"创建图谱记忆更新器失败 (尝试 {attempt + 1}/{max_retries}): {e}, "
+                                     f"{retry_interval}秒后重试...")
+                        time.sleep(retry_interval)
+                    else:
+                        logger.error(f"创建图谱记忆更新器失败，已达最大重试次数: {e}")
+                        raise
+
+            if updater:
+                cls._updaters[simulation_id] = updater
+                logger.info(f"创建图谱记忆更新器: simulation_id={simulation_id}, graph_id={graph_id}, "
+                           f"entity_extraction={enable_entity_extraction}")
+                return updater
+            else:
+                raise last_error
     
     @classmethod
     def get_updater(cls, simulation_id: str) -> Optional[ZepGraphMemoryUpdater]:

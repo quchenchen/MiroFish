@@ -5,6 +5,7 @@ Neo4j 图数据库服务
 """
 
 import time
+import json
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
 from datetime import datetime
@@ -17,6 +18,62 @@ from ...utils.logger import get_logger
 from .types import Node, Edge, EdgeInfo, NodeInfo
 
 logger = get_logger('mirofish.zep_adapter.graph')
+
+
+def _sanitize_attributes(attributes: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    清洗属性值，确保所有值都是 Neo4j 支持的原始类型或数组
+
+    Neo4j 不支持嵌套的 dict/map，需要转换为 JSON 字符串
+    """
+    sanitized = {}
+    for key, value in attributes.items():
+        if value is None:
+            sanitized[key] = None
+        elif isinstance(value, (str, int, float, bool)):
+            sanitized[key] = value
+        elif isinstance(value, list):
+            # 递归清洗列表中的每个元素
+            sanitized[key] = [_sanitize_item(item) for item in value]
+        elif isinstance(value, dict) or hasattr(value, 'items'):
+            # 处理 Python dict 和 Neo4j Map 对象
+            # 先转换为纯 Python dict，再序列化为 JSON
+            try:
+                if hasattr(value, 'items'):
+                    # Neo4j Map 对象，转换为 dict
+                    value_dict = {k: _sanitize_item(v) for k, v in value.items()}
+                else:
+                    value_dict = {k: _sanitize_item(v) for k, v in value.items()}
+                sanitized[key] = json.dumps(value_dict, ensure_ascii=False)
+            except Exception:
+                # 如果转换失败，转换为字符串
+                sanitized[key] = str(value)
+        else:
+            # 其他类型转换为字符串
+            sanitized[key] = str(value)
+    return sanitized
+
+
+def _sanitize_item(item: Any) -> Any:
+    """递归清洗单个值"""
+    if item is None:
+        return None
+    elif isinstance(item, (str, int, float, bool)):
+        return item
+    elif isinstance(item, list):
+        return [_sanitize_item(i) for i in item]
+    elif isinstance(item, dict) or hasattr(item, 'items'):
+        # 处理 Python dict 和 Neo4j Map 对象
+        try:
+            if hasattr(item, 'items'):
+                # Neo4j Map 对象
+                return json.dumps({k: _sanitize_item(v) for k, v in item.items()}, ensure_ascii=False)
+            else:
+                return json.dumps({k: _sanitize_item(v) for k, v in item.items()}, ensure_ascii=False)
+        except Exception:
+            return str(item)
+    else:
+        return str(item)
 
 
 class Neo4jRepository:
@@ -209,12 +266,12 @@ class Neo4jRepository:
         # 构建 Cypher 标签字符串
         label_str = ":".join(labels)
 
-        # 合并属性
+        # 合并属性并清洗非原始类型
         all_attributes = {
             "graph_id": graph_id,
             "name": name,
             "summary": summary,
-            **attributes
+            **_sanitize_attributes(attributes)
         }
 
         # 构建动态 CREATE 查询
@@ -360,18 +417,25 @@ class Neo4jRepository:
         query = """
         MATCH (n {graph_id: $graph_id})
         RETURN n.uuid as uuid, n.name as name, n.summary as summary,
-               labels(n) as labels
+               n.content as content, labels(n) as labels
         ORDER BY n.name
         """
         results = self._execute_query(query, {"graph_id": graph_id})
 
         nodes = []
         for data in results:
+            # 将 content 放入 attributes 中
+            attributes = {}
+            content = data.get("content")
+            if content:
+                attributes["content"] = content
+
             nodes.append(Node(
                 uuid_=data.get("uuid", ""),
                 name=data.get("name", ""),
                 labels=data.get("labels", []),
-                summary=data.get("summary", "")
+                summary=data.get("summary", ""),
+                attributes=attributes
             ))
 
         logger.info(f"获取节点: {len(nodes)} 个")

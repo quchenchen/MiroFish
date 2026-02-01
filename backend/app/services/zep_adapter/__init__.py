@@ -9,7 +9,7 @@ Zep 本地适配器
     - 适配器层: 保持与 zep-cloud SDK 相同的接口
 """
 
-from .client import ZepClient, Zep  # Zep 作为别名保持兼容性
+from .client import ZepClient, ZepEntityReaderLocal, ZepToolsServiceLocal, Zep  # Zep 作为别名保持兼容性
 from .types import (
     SearchResult,
     NodeInfo,
@@ -18,12 +18,16 @@ from .types import (
     PanoramaResult,
     AgentInterview,
     InterviewResult,
+    FilteredEntities,
+    Node as EntityNode,  # Node 别名为 EntityNode 保持兼容
 )
 from .graph import GraphService
 from .vector import VectorService
 
 __all__ = [
     "ZepClient",
+    "ZepEntityReaderLocal",
+    "ZepToolsServiceLocal",
     "Zep",  # 别名，用于替换 zep_cloud.client.Zep
     "GraphService",
     "VectorService",
@@ -34,4 +38,6 @@ __all__ = [
     "PanoramaResult",
     "AgentInterview",
     "InterviewResult",
+    "FilteredEntities",
+    "EntityNode",  # Node 的别名
 ]

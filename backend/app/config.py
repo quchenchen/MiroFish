@@ -10,11 +10,18 @@ from dotenv import load_dotenv
 # 路径: MiroFish/.env (相对于 backend/app/config.py)
 project_root_env = os.path.join(os.path.dirname(__file__), '../../.env')
 
-if os.path.exists(project_root_env):
-    load_dotenv(project_root_env, override=True)
+# 检查是否在 Docker 容器中运行
+IN_DOCKER = os.path.exists('/.dockerenv')
+
+if IN_DOCKER:
+    # Docker 环境：环境变量已由 docker-compose 设置，不加载 .env 文件
+    # 避免 .env 文件覆盖 Docker 传入的环境变量
+    pass
+elif os.path.exists(project_root_env):
+    load_dotenv(project_root_env, override=False)  # 不覆盖已存在的环境变量
 else:
     # 如果根目录没有 .env，尝试加载环境变量（用于生产环境）
-    load_dotenv(override=True)
+    load_dotenv(override=False)
 
 
 class Config:
@@ -30,10 +37,10 @@ class Config:
     # JSON配置 - 禁用ASCII转义，让中文直接显示（而不是 \uXXXX 格式）
     JSON_AS_ASCII = False
     
-    # LLM配置（统一使用OpenAI格式）
+    # LLM配置（统一使用OpenAI格式，默认阿里云DashScope）
     LLM_API_KEY = os.environ.get('LLM_API_KEY')
-    LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://api.openai.com/v1')
-    LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'gpt-4o-mini')
+    LLM_BASE_URL = os.environ.get('LLM_BASE_URL', 'https://dashscope.aliyuncs.com/compatible-mode/v1')
+    LLM_MODEL_NAME = os.environ.get('LLM_MODEL_NAME', 'qwen-plus')
     
     # Zep配置
     ZEP_API_KEY = os.environ.get('ZEP_API_KEY')
@@ -49,8 +56,8 @@ class Config:
     # Qdrant 配置 (本地模式)
     QDRANT_URL = os.environ.get('QDRANT_URL', 'http://localhost:6333')
 
-    # Embedding 模型配置 (本地模式)
-    EMBEDDING_MODEL = os.environ.get('EMBEDDING_MODEL', 'text-embedding-3-small')
+    # Embedding 模型配置 (本地模式，默认阿里云)
+    EMBEDDING_MODEL = os.environ.get('EMBEDDING_MODEL', 'text-embedding-v3')
 
     # 文件上传配置
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB
@@ -64,6 +71,9 @@ class Config:
     # OASIS模拟配置
     OASIS_DEFAULT_MAX_ROUNDS = int(os.environ.get('OASIS_DEFAULT_MAX_ROUNDS', '10'))
     OASIS_SIMULATION_DATA_DIR = os.path.join(os.path.dirname(__file__), '../uploads/simulations')
+
+    # 模拟脚本使用的 Python 解释器（camel-ai 需要 Python 3.12）
+    SIMULATION_PYTHON = os.environ.get('SIMULATION_PYTHON', 'python3.12')
     
     # OASIS平台可用动作配置
     OASIS_TWITTER_ACTIONS = [

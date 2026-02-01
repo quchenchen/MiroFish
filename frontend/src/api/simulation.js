@@ -93,6 +93,16 @@ export const stopSimulation = (data) => {
 }
 
 /**
+ * 更新模拟状态
+ * @param {Object} data - { simulation_id, status }
+ * @example
+ * updateSimulationStatus({ simulation_id: 'sim_xxx', status: 'ready' })
+ */
+export const updateSimulationStatus = (data) => {
+  return service.post('/api/simulation/update-status', data)
+}
+
+/**
  * 获取模拟运行实时状态
  * @param {string} simulationId
  */

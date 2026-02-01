@@ -56,9 +56,16 @@ class NodeInfo:
             "attributes": self.attributes
         }
 
+    def get_entity_type(self) -> Optional[str]:
+        """获取实体类型（排除默认的Entity标签）"""
+        for label in self.labels:
+            if label not in ["Entity", "Node"]:
+                return label
+        return None
+
     def to_text(self) -> str:
         """转换为文本格式"""
-        entity_type = next((l for l in self.labels if l not in ["Entity", "Node"]), "未知类型")
+        entity_type = self.get_entity_type() or "未知类型"
         return f"实体: {self.name} (类型: {entity_type})\n摘要: {self.summary}"
 
 
@@ -395,6 +402,13 @@ class Node:
         self.labels = labels or []
         self.summary = summary
         self.attributes = attributes or {}
+
+    def get_entity_type(self) -> Optional[str]:
+        """获取实体类型（排除默认的Entity标签）"""
+        for label in self.labels:
+            if label not in ["Entity", "Node"]:
+                return label
+        return None
 
 
 class Edge:

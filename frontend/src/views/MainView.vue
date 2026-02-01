@@ -323,20 +323,20 @@ const pollTaskStatus = async (taskId) => {
     const res = await getTaskStatus(taskId)
     if (res.success) {
       const task = res.data
-      
+
       // Log progress message if it changed
       if (task.message && task.message !== buildProgress.value?.message) {
         addLog(task.message)
       }
-      
+
       buildProgress.value = { progress: task.progress || 0, message: task.message }
-      
+
       if (task.status === 'completed') {
         addLog('Graph build task completed.')
         stopPolling()
         stopGraphPolling() // Stop polling, do final load
         currentPhase.value = 2
-        
+
         // Final load
         const projRes = await getProject(currentProjectId.value)
         if (projRes.success && projRes.data.graph_id) {
@@ -350,7 +350,46 @@ const pollTaskStatus = async (taskId) => {
       }
     }
   } catch (e) {
-    console.error(e)
+    // If task not found (404), check project status instead
+    // This handles server restarts where in-memory tasks are lost
+    if (e.response?.status === 404) {
+      addLog('Task not found (server may have restarted), checking project status...')
+      try {
+        const projRes = await getProject(currentProjectId.value)
+        if (projRes.success) {
+          const project = projRes.data
+          if (project.status === 'graph_completed' && project.graph_id) {
+            addLog('Project already completed. Loading graph...')
+            stopPolling()
+            stopGraphPolling()
+            currentPhase.value = 2
+            projectData.value = project
+            await loadGraph(project.graph_id)
+          } else if (project.status === 'graph_building') {
+            // Project still building but task lost - stop and notify user
+            stopPolling()
+            error.value = '构建任务已丢失（服务器可能重启过），请点击"开始构建"重新开始'
+            addLog('Task lost during build, please restart manually')
+          } else if (project.status === 'failed') {
+            stopPolling()
+            error.value = project.error || 'Build failed'
+            addLog(`Project build failed: ${project.error}`)
+          } else {
+            // Project in unexpected state, stop polling
+            stopPolling()
+            addLog(`Project in unexpected state: ${project.status}`)
+          }
+        } else {
+          // Project not found - stop polling
+          stopPolling()
+          addLog(`Project not found: ${projRes.error}`)
+        }
+      } catch (projErr) {
+        console.error('Failed to check project status:', projErr)
+      }
+    } else {
+      console.error('Error polling task status:', e)
+    }
   }
 }
 

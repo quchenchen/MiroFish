@@ -784,36 +784,36 @@ const startPollingTask = (taskId) => {
 const pollTaskStatus = async (taskId) => {
   try {
     const response = await getTaskStatus(taskId)
-    
+
     if (response.success) {
       const task = response.data
-      
+
       // 更新进度显示
       buildProgress.value = {
         progress: task.progress || 0,
         message: task.message || '处理中...'
       }
-      
+
       console.log('Task status:', task.status, 'Progress:', task.progress)
-      
+
       if (task.status === 'completed') {
         console.log('✅ 图谱构建完成，正在加载完整数据...')
-        
+
         stopPolling()
         stopGraphPolling()
         currentPhase.value = 2
-        
+
         // 更新进度显示为完成状态
         buildProgress.value = {
           progress: 100,
           message: '构建完成，正在加载图谱...'
         }
-        
+
         // 重新加载项目数据获取 graph_id
         const projectResponse = await getProject(currentProjectId.value)
         if (projectResponse.success) {
           projectData.value = projectResponse.data
-          
+
           // 最终加载完整图谱数据
           if (projectResponse.data.graph_id) {
             console.log('📊 加载完整图谱:', projectResponse.data.graph_id)
@@ -821,7 +821,7 @@ const pollTaskStatus = async (taskId) => {
             console.log('✅ 图谱加载完成')
           }
         }
-        
+
         // 清除进度显示
         buildProgress.value = null
       } else if (task.status === 'failed') {
@@ -832,7 +832,42 @@ const pollTaskStatus = async (taskId) => {
       }
     }
   } catch (err) {
-    console.error('Poll task error:', err)
+    // If task not found (404), check project status instead
+    // This handles server restarts where in-memory tasks are lost
+    if (err.response?.status === 404) {
+      console.log('Task not found (server may have restarted), checking project status...')
+      try {
+        const projectResponse = await getProject(currentProjectId.value)
+        if (projectResponse.success) {
+          const project = projectResponse.data
+          if (project.status === 'graph_completed' && project.graph_id) {
+            console.log('Project already completed. Loading graph...')
+            stopPolling()
+            stopGraphPolling()
+            currentPhase.value = 2
+            projectData.value = project
+            await loadGraph(project.graph_id)
+          } else if (project.status === 'graph_building') {
+            // Project still building but task lost
+            console.log('Task lost during build, may need to restart')
+            stopPolling()
+            error.value = '构建任务已丢失，请重新开始'
+          } else if (project.status === 'failed') {
+            stopPolling()
+            stopGraphPolling()
+            error.value = '图谱构建失败: ' + (project.error || '未知错误')
+          } else {
+            // Project in unexpected state
+            stopPolling()
+            error.value = `项目状态异常: ${project.status}`
+          }
+        }
+      } catch (projErr) {
+        console.error('Failed to check project status:', projErr)
+      }
+    } else {
+      console.error('Poll task error:', err)
+    }
   }
 }
 

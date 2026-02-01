@@ -14,6 +14,9 @@ from zep_cloud.client import Zep
 from zep_cloud import EpisodeData, EntityEdgeSourceTarget
 
 from ..config import Config
+from ..utils.logger import get_logger
+
+logger = get_logger('mirofish.graph_builder')
 from ..models.task import TaskManager, TaskStatus
 from .text_processor import TextProcessor
 
@@ -38,16 +41,25 @@ class GraphInfo:
 class GraphBuilderService:
     """
     图谱构建服务
-    负责调用Zep API构建知识图谱
+    负责调用Zep API构建知识图谱（支持本地和云端模式）
     """
-    
+
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key or Config.ZEP_API_KEY
-        if not self.api_key:
-            raise ValueError("ZEP_API_KEY 未配置")
-        
-        self.client = Zep(api_key=self.api_key)
+        self._use_local = getattr(Config, 'ZEP_USE_LOCAL', False)
         self.task_manager = TaskManager()
+
+        if self._use_local:
+            # 本地模式使用 ZepClient 适配器
+            from .zep_adapter import ZepClient
+            self.client = ZepClient()
+            logger.info("GraphBuilderService 初始化完成 (本地模式)")
+        else:
+            # 云端模式使用原始 Zep SDK
+            if not self.api_key:
+                raise ValueError("ZEP_API_KEY 未配置")
+            self.client = Zep(api_key=self.api_key)
+            logger.info("GraphBuilderService 初始化完成 (云端模式)")
     
     def build_graph_async(
         self,
@@ -146,22 +158,59 @@ class GraphBuilderService:
                 )
             )
             
-            # 5. 等待Zep处理完成
-            self.task_manager.update_task(
-                task_id,
-                progress=60,
-                message="等待Zep处理数据..."
-            )
-            
-            self._wait_for_episodes(
-                episode_uuids,
-                lambda msg, prog: self.task_manager.update_task(
+            # 5. 等待Zep处理完成 / 本地模式实体抽取
+            if self._use_local:
+                logger.info("本地模式: 开始 LLM 实体抽取...")
+                self.task_manager.update_task(
                     task_id,
-                    progress=60 + int(prog * 0.3),  # 60-90%
-                    message=msg
+                    progress=60,
+                    message="开始 LLM 实体抽取..."
                 )
-            )
-            
+
+                try:
+                    # 使用 LLM 抽取实体和关系
+                    from .entity_extractor import GraphEntityExtractor
+                    extractor = GraphEntityExtractor()
+
+                    # 合并所有文本块进行实体抽取
+                    full_text = "\n\n".join(chunks)
+                    logger.info(f"开始抽取实体，文本长度: {len(full_text)}")
+
+                    # 执行抽取并存储
+                    extraction_result = extractor.extract_and_store(
+                        graph_id=graph_id,
+                        text=full_text,
+                        ontology=ontology
+                    )
+
+                    logger.info(f"实体抽取完成: {len(extraction_result.entities)} 个实体, {len(extraction_result.relations)} 个关系")
+
+                    self.task_manager.update_task(
+                        task_id,
+                        progress=85,
+                        message=f"实体抽取完成: {len(extraction_result.entities)} 个实体, {len(extraction_result.relations)} 个关系"
+                    )
+                except Exception as e:
+                    logger.error(f"实体抽取失败: {e}")
+                    import traceback
+                    logger.error(traceback.format_exc())
+                    # 继续执行，不让抽取失败阻止整个流程
+            else:
+                self.task_manager.update_task(
+                    task_id,
+                    progress=60,
+                    message="等待Zep处理数据..."
+                )
+
+                self._wait_for_episodes(
+                    episode_uuids,
+                    lambda msg, prog: self.task_manager.update_task(
+                        task_id,
+                        progress=60 + int(prog * 0.3),  # 60-90%
+                        message=msg
+                    )
+                )
+
             # 6. 获取图谱信息
             self.task_manager.update_task(
                 task_id,
@@ -186,13 +235,20 @@ class GraphBuilderService:
     def create_graph(self, name: str) -> str:
         """创建Zep图谱（公开方法）"""
         graph_id = f"mirofish_{uuid.uuid4().hex[:16]}"
-        
-        self.client.graph.create(
-            graph_id=graph_id,
-            name=name,
-            description="MiroFish Social Simulation Graph"
-        )
-        
+
+        if self._use_local:
+            # 本地模式: 直接创建图谱标记
+            from .zep_adapter import GraphService
+            self.client.graph.neo4j.create_graph(graph_id)
+            logger.info(f"本地图谱已创建: {graph_id}")
+        else:
+            # 云端模式: 使用 Zep SDK
+            self.client.graph.create(
+                graph_id=graph_id,
+                name=name,
+                description="MiroFish Social Simulation Graph"
+            )
+
         return graph_id
     
     def set_ontology(self, graph_id: str, ontology: Dict[str, Any]):
@@ -277,12 +333,30 @@ class GraphBuilderService:
                 edge_definitions[name] = (edge_class, source_targets)
         
         # 调用Zep API设置本体
-        if entity_types or edge_definitions:
-            self.client.graph.set_ontology(
-                graph_ids=[graph_id],
-                entities=entity_types if entity_types else None,
-                edges=edge_definitions if edge_definitions else None,
-            )
+        if self._use_local:
+            # 本地模式: 将本体存储为图谱属性
+            import json
+            from .zep_adapter import GraphService
+            # 将本体存储在 Neo4j 的 Graph 节点中
+            ontology_json = json.dumps(ontology)
+            query = """
+            MATCH (g:Graph {id: $graph_id})
+            SET g.ontology = $ontology
+            RETURN g
+            """
+            self.client.graph.neo4j._execute_write(query, {
+                "graph_id": graph_id,
+                "ontology": ontology_json
+            })
+            logger.info(f"本地图谱本体已设置: {graph_id}")
+        else:
+            # 云端模式: 使用 Zep SDK
+            if entity_types or edge_definitions:
+                self.client.graph.set_ontology(
+                    graph_ids=[graph_id],
+                    entities=entity_types if entity_types else None,
+                    edges=edge_definitions if edge_definitions else None,
+                )
     
     def add_text_batches(
         self,
@@ -294,47 +368,68 @@ class GraphBuilderService:
         """分批添加文本到图谱，返回所有 episode 的 uuid 列表"""
         episode_uuids = []
         total_chunks = len(chunks)
-        
-        for i in range(0, total_chunks, batch_size):
-            batch_chunks = chunks[i:i + batch_size]
-            batch_num = i // batch_size + 1
-            total_batches = (total_chunks + batch_size - 1) // batch_size
-            
-            if progress_callback:
-                progress = (i + len(batch_chunks)) / total_chunks
-                progress_callback(
-                    f"发送第 {batch_num}/{total_batches} 批数据 ({len(batch_chunks)} 块)...",
-                    progress
-                )
-            
-            # 构建episode数据
-            episodes = [
-                EpisodeData(data=chunk, type="text")
-                for chunk in batch_chunks
-            ]
-            
-            # 发送到Zep
-            try:
-                batch_result = self.client.graph.add_batch(
-                    graph_id=graph_id,
-                    episodes=episodes
-                )
-                
-                # 收集返回的 episode uuid
-                if batch_result and isinstance(batch_result, list):
-                    for ep in batch_result:
-                        ep_uuid = getattr(ep, 'uuid_', None) or getattr(ep, 'uuid', None)
-                        if ep_uuid:
-                            episode_uuids.append(ep_uuid)
-                
-                # 避免请求过快
-                time.sleep(1)
-                
-            except Exception as e:
+
+        if self._use_local:
+            # 本地模式: 使用 add 方法添加文本
+            for i, chunk in enumerate(chunks):
+                chunk_num = i + 1
+                if progress_callback and i % batch_size == 0:
+                    progress = i / total_chunks
+                    progress_callback(
+                        f"添加第 {chunk_num}/{total_chunks} 块文本...",
+                        progress
+                    )
+
+                # 使用本地适配器的 add 方法
+                self.client.graph.add(graph_id=graph_id, type_="text", data=chunk)
+                # 为每个文本块生成一个虚拟 uuid
+                import uuid
+                episode_uuids.append(f"local_{uuid.uuid4().hex[:16]}")
+
+                if i % batch_size == batch_size - 1:
+                    time.sleep(0.5)  # 避免操作过快
+        else:
+            # 云端模式: 使用 Zep SDK 的 add_batch
+            for i in range(0, total_chunks, batch_size):
+                batch_chunks = chunks[i:i + batch_size]
+                batch_num = i // batch_size + 1
+                total_batches = (total_chunks + batch_size - 1) // batch_size
+
                 if progress_callback:
-                    progress_callback(f"批次 {batch_num} 发送失败: {str(e)}", 0)
-                raise
-        
+                    progress = (i + len(batch_chunks)) / total_chunks
+                    progress_callback(
+                        f"发送第 {batch_num}/{total_batches} 批数据 ({len(batch_chunks)} 块)...",
+                        progress
+                    )
+
+                # 构建episode数据
+                episodes = [
+                    EpisodeData(data=chunk, type="text")
+                    for chunk in batch_chunks
+                ]
+
+                # 发送到Zep
+                try:
+                    batch_result = self.client.graph.add_batch(
+                        graph_id=graph_id,
+                        episodes=episodes
+                    )
+
+                    # 收集返回的 episode uuid
+                    if batch_result and isinstance(batch_result, list):
+                        for ep in batch_result:
+                            ep_uuid = getattr(ep, 'uuid_', None) or getattr(ep, 'uuid', None)
+                            if ep_uuid:
+                                episode_uuids.append(ep_uuid)
+
+                    # 避免请求过快
+                    time.sleep(1)
+
+                except Exception as e:
+                    if progress_callback:
+                        progress_callback(f"批次 {batch_num} 发送失败: {str(e)}", 0)
+                    raise
+
         return episode_uuids
     
     def _wait_for_episodes(
@@ -344,19 +439,25 @@ class GraphBuilderService:
         timeout: int = 600
     ):
         """等待所有 episode 处理完成（通过查询每个 episode 的 processed 状态）"""
+        if self._use_local:
+            # 本地模式: 跳过等待，直接返回
+            if progress_callback:
+                progress_callback(f"本地模式: {len(episode_uuids)} 个文本块已添加", 1.0)
+            return
+
         if not episode_uuids:
             if progress_callback:
                 progress_callback("无需等待（没有 episode）", 1.0)
             return
-        
+
         start_time = time.time()
         pending_episodes = set(episode_uuids)
         completed_count = 0
         total_episodes = len(episode_uuids)
-        
+
         if progress_callback:
             progress_callback(f"开始等待 {total_episodes} 个文本块处理...", 0)
-        
+
         while pending_episodes:
             if time.time() - start_time > timeout:
                 if progress_callback:
@@ -365,21 +466,21 @@ class GraphBuilderService:
                         completed_count / total_episodes
                     )
                 break
-            
+
             # 检查每个 episode 的处理状态
             for ep_uuid in list(pending_episodes):
                 try:
                     episode = self.client.graph.episode.get(uuid_=ep_uuid)
                     is_processed = getattr(episode, 'processed', False)
-                    
+
                     if is_processed:
                         pending_episodes.remove(ep_uuid)
                         completed_count += 1
-                        
+
                 except Exception as e:
                     # 忽略单个查询错误，继续
                     pass
-            
+
             elapsed = int(time.time() - start_time)
             if progress_callback:
                 progress_callback(
@@ -397,10 +498,10 @@ class GraphBuilderService:
         """获取图谱信息"""
         # 获取节点
         nodes = self.client.graph.node.get_by_graph_id(graph_id=graph_id)
-        
+
         # 获取边
         edges = self.client.graph.edge.get_by_graph_id(graph_id=graph_id)
-        
+
         # 统计实体类型
         entity_types = set()
         for node in nodes:
@@ -408,7 +509,7 @@ class GraphBuilderService:
                 for label in node.labels:
                     if label not in ["Entity", "Node"]:
                         entity_types.add(label)
-        
+
         return GraphInfo(
             graph_id=graph_id,
             node_count=len(nodes),
@@ -419,58 +520,70 @@ class GraphBuilderService:
     def get_graph_data(self, graph_id: str) -> Dict[str, Any]:
         """
         获取完整图谱数据（包含详细信息）
-        
+
         Args:
             graph_id: 图谱ID
-            
+
         Returns:
             包含nodes和edges的字典，包括时间信息、属性等详细数据
         """
         nodes = self.client.graph.node.get_by_graph_id(graph_id=graph_id)
         edges = self.client.graph.edge.get_by_graph_id(graph_id=graph_id)
-        
+
         # 创建节点映射用于获取节点名称
         node_map = {}
         for node in nodes:
-            node_map[node.uuid_] = node.name or ""
-        
+            # 兼容本地适配器的 uuid 和云端 SDK 的 uuid_
+            node_uuid = getattr(node, 'uuid_', None) or getattr(node, 'uuid', None)
+            if node_uuid:
+                node_map[node_uuid] = node.name or ""
+
         nodes_data = []
         for node in nodes:
+            # 兼容本地适配器的 uuid 和云端 SDK 的 uuid_
+            node_uuid = getattr(node, 'uuid_', None) or getattr(node, 'uuid', None)
             # 获取创建时间
             created_at = getattr(node, 'created_at', None)
             if created_at:
                 created_at = str(created_at)
-            
+
             nodes_data.append({
-                "uuid": node.uuid_,
+                "uuid": node_uuid,
                 "name": node.name,
                 "labels": node.labels or [],
                 "summary": node.summary or "",
                 "attributes": node.attributes or {},
                 "created_at": created_at,
             })
-        
+
         edges_data = []
         for edge in edges:
+            # 兼容本地适配器的 uuid 和云端 SDK 的 uuid_
+            edge_uuid = getattr(edge, 'uuid_', None) or getattr(edge, 'uuid', None)
             # 获取时间信息
             created_at = getattr(edge, 'created_at', None)
             valid_at = getattr(edge, 'valid_at', None)
             invalid_at = getattr(edge, 'invalid_at', None)
             expired_at = getattr(edge, 'expired_at', None)
-            
+
             # 获取 episodes
             episodes = getattr(edge, 'episodes', None) or getattr(edge, 'episode_ids', None)
             if episodes and not isinstance(episodes, list):
                 episodes = [str(episodes)]
             elif episodes:
                 episodes = [str(e) for e in episodes]
-            
+
             # 获取 fact_type
             fact_type = getattr(edge, 'fact_type', None) or edge.name or ""
-            
+
+            # 获取关系类型的中文标签
+            from .entity_extractor import get_relation_label
+            relation_label = get_relation_label(edge.name or "", lang="zh")
+
             edges_data.append({
-                "uuid": edge.uuid_,
+                "uuid": edge_uuid,
                 "name": edge.name or "",
+                "label": relation_label,  # 中文显示标签
                 "fact": edge.fact or "",
                 "fact_type": fact_type,
                 "source_node_uuid": edge.source_node_uuid,
@@ -484,7 +597,7 @@ class GraphBuilderService:
                 "expired_at": str(expired_at) if expired_at else None,
                 "episodes": episodes or [],
             })
-        
+
         return {
             "graph_id": graph_id,
             "nodes": nodes_data,
@@ -495,5 +608,11 @@ class GraphBuilderService:
     
     def delete_graph(self, graph_id: str):
         """删除图谱"""
-        self.client.graph.delete(graph_id=graph_id)
+        if self._use_local:
+            # 本地模式: 调用 Neo4jRepository 的 delete_graph
+            self.client.graph.neo4j.delete_graph(graph_id)
+            logger.info(f"本地图谱已删除: {graph_id}")
+        else:
+            # 云端模式: 使用 Zep SDK
+            self.client.graph.delete(graph_id=graph_id)
 

@@ -1,8 +1,9 @@
 services:
   mirofish:
-    image: ghcr.io/666ghj/mirofish:latest
-    # 加速镜像（如拉取缓慢可替换上方地址）
-    # image: ghcr.nju.edu.cn/666ghj/mirofish:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: mirofish:latest
     container_name: mirofish
     env_file:
       - .env
@@ -43,6 +44,7 @@ services:
       retries: 5
 
   # Qdrant 向量数据库 (本地 Zep 语义搜索替代方案)
+  # 注意: 精简版镜像无 curl，healthcheck 已禁用（服务正常运行）
   qdrant:
     image: qdrant/qdrant:v1.12.4
     container_name: mirofish-qdrant
@@ -54,11 +56,7 @@ services:
     restart: unless-stopped
     networks:
       - mirofish-network
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+    # healthcheck 已禁用 - 镜像不含 curl，但服务正常运行
 
 networks:
   mirofish-network:

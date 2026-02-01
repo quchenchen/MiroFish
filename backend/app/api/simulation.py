@@ -304,10 +304,11 @@ def _check_simulation_prepared(simulation_id: str) -> tuple:
         # - ready: 准备完成，可以运行
         # - preparing: 如果 config_generated=True 说明已完成
         # - running: 正在运行，说明准备早就完成了
+        # - paused: 已暂停，说明准备早就完成了
         # - completed: 运行完成，说明准备早就完成了
         # - stopped: 已停止，说明准备早就完成了
         # - failed: 运行失败（但准备是完成的）
-        prepared_statuses = ["ready", "preparing", "running", "completed", "stopped", "failed"]
+        prepared_statuses = ["ready", "preparing", "running", "paused", "completed", "stopped", "failed"]
         if status in prepared_statuses and config_generated:
             # 获取文件统计信息
             profiles_file = os.path.join(simulation_dir, "reddit_profiles.json")
@@ -1601,7 +1602,8 @@ def start_simulation():
             platform=platform,
             max_rounds=max_rounds,
             enable_graph_memory_update=enable_graph_memory_update,
-            graph_id=graph_id
+            graph_id=graph_id,
+            project_id=state.project_id  # 传递项目ID用于获取本体
         )
         
         # 更新模拟状态
@@ -1627,6 +1629,175 @@ def start_simulation():
             "error": str(e)
         }), 400
         
+    except Exception as e:
+        logger.error(f"启动模拟失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/<simulation_id>/start', methods=['GET', 'POST'])
+def start_simulation_by_id(simulation_id: str):
+    """
+    通过 simulation_id 启动模拟（支持 GET 和 POST）
+
+    URL 参数 (GET) 或表单参数 (POST)：
+        maxRounds: 最大模拟轮数（可选）
+        platform: 平台类型 twitter/reddit/parallel（默认 parallel）
+        force: 是否强制重新开始（默认 false）
+        enable_graph_memory_update: 是否启用图谱记忆更新（默认 false）
+
+    返回：
+        {
+            "success": true,
+            "data": {
+                "simulation_id": "sim_xxxx",
+                "runner_status": "running",
+                ...
+            }
+        }
+    """
+    try:
+        # 支持 GET 和 POST 参数
+        if request.method == 'POST':
+            data = request.form.to_dict() or request.get_json() or {}
+        else:
+            data = request.args.to_dict()
+
+        # 使用 URL 路径中的 simulation_id
+        data['simulation_id'] = simulation_id
+
+        # 参数名兼容：maxRounds -> max_rounds
+        if 'maxRounds' in data and 'max_rounds' not in data:
+            data['max_rounds'] = data['maxRounds']
+
+        # 其余处理逻辑与 start_simulation 相同
+        platform = data.get('platform', 'parallel')
+        max_rounds = data.get('max_rounds')
+        enable_graph_memory_update = data.get('enable_graph_memory_update', False)
+        force = data.get('force', False)
+
+        # 验证 max_rounds 参数
+        if max_rounds is not None:
+            try:
+                max_rounds = int(max_rounds)
+                if max_rounds <= 0:
+                    return jsonify({
+                        "success": False,
+                        "error": "max_rounds 必须是正整数"
+                    }), 400
+            except (ValueError, TypeError):
+                return jsonify({
+                    "success": False,
+                    "error": "max_rounds 必须是有效的整数"
+                }), 400
+
+        if platform not in ['twitter', 'reddit', 'parallel']:
+            return jsonify({
+                "success": False,
+                "error": f"无效的平台类型: {platform}，可选: twitter/reddit/parallel"
+            }), 400
+
+        # 检查模拟是否已准备好
+        manager = SimulationManager()
+        state = manager.get_simulation(simulation_id)
+
+        if not state:
+            return jsonify({
+                "success": False,
+                "error": f"模拟不存在: {simulation_id}"
+            }), 404
+
+        force_restarted = False
+
+        # 智能处理状态
+        if state.status != SimulationStatus.READY:
+            is_prepared, prepare_info = _check_simulation_prepared(simulation_id)
+
+            if is_prepared:
+                if state.status == SimulationStatus.RUNNING:
+                    run_state = SimulationRunner.get_run_state(simulation_id)
+                    if run_state and run_state.runner_status.value == "running":
+                        if force:
+                            logger.info(f"强制模式：停止运行中的模拟 {simulation_id}")
+                            try:
+                                SimulationRunner.stop_simulation(simulation_id)
+                            except Exception as e:
+                                logger.warning(f"停止模拟时出现警告: {str(e)}")
+                        else:
+                            return jsonify({
+                                "success": False,
+                                "error": f"模拟正在运行中，请先调用 /stop 接口停止，或使用 force=true 强制重新开始"
+                            }), 400
+
+                if force:
+                    logger.info(f"强制模式：清理模拟日志 {simulation_id}")
+                    cleanup_result = SimulationRunner.cleanup_simulation_logs(simulation_id)
+                    if not cleanup_result.get("success"):
+                        logger.warning(f"清理日志时出现警告: {cleanup_result.get('errors')}")
+                    force_restarted = True
+
+                logger.info(f"模拟 {simulation_id} 准备工作已完成，重置状态为 ready（原状态: {state.status.value}）")
+                state.status = SimulationStatus.READY
+                manager._save_simulation_state(state)
+            else:
+                return jsonify({
+                    "success": False,
+                    "error": f"模拟未准备好，当前状态: {state.status.value}，请先调用 /prepare 接口"
+                }), 400
+
+        # 获取图谱ID
+        graph_id = None
+        if enable_graph_memory_update:
+            graph_id = state.graph_id
+            if not graph_id:
+                project = ProjectManager.get_project(state.project_id)
+                if project:
+                    graph_id = project.graph_id
+
+            if not graph_id:
+                return jsonify({
+                    "success": False,
+                    "error": "启用图谱记忆更新需要有效的 graph_id，请确保项目已构建图谱"
+                }), 400
+
+            logger.info(f"启用图谱记忆更新: simulation_id={simulation_id}, graph_id={graph_id}")
+
+        # 启动模拟
+        run_state = SimulationRunner.start_simulation(
+            simulation_id=simulation_id,
+            platform=platform,
+            max_rounds=max_rounds,
+            enable_graph_memory_update=enable_graph_memory_update,
+            graph_id=graph_id,
+            project_id=state.project_id  # 传递项目ID用于获取本体
+        )
+
+        # 更新模拟状态
+        state.status = SimulationStatus.RUNNING
+        manager._save_simulation_state(state)
+
+        response_data = run_state.to_dict()
+        if max_rounds:
+            response_data['max_rounds_applied'] = max_rounds
+        response_data['graph_memory_update_enabled'] = enable_graph_memory_update
+        response_data['force_restarted'] = force_restarted
+        if enable_graph_memory_update:
+            response_data['graph_id'] = graph_id
+
+        return jsonify({
+            "success": True,
+            "data": response_data
+        })
+
+    except ValueError as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 400
+
     except Exception as e:
         logger.error(f"启动模拟失败: {str(e)}")
         return jsonify({
@@ -1688,6 +1859,121 @@ def stop_simulation():
         
     except Exception as e:
         logger.error(f"停止模拟失败: {str(e)}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@simulation_bp.route('/update-status', methods=['POST'])
+def update_simulation_status():
+    """
+    更新模拟状态
+
+    允许前端手动切换模拟状态（如 paused -> ready）
+
+    请求（JSON）：
+        {
+            "simulation_id": "sim_xxxx",  // 必填，模拟ID
+            "status": "ready"              // 必填，目标状态
+        }
+
+    支持的状态转换：
+        - paused -> ready: 允许重新启动已暂停的模拟
+        - stopped -> ready: 允许重新启动已停止的模拟
+        - completed -> ready: 允许重新运行已完成的模拟
+        - ready -> paused: 手动暂停准备好的模拟
+        - ready -> stopped: 停止准备好的模拟
+
+    返回：
+        {
+            "success": true,
+            "data": {
+                "simulation_id": "sim_xxxx",
+                "old_status": "paused",
+                "new_status": "ready"
+            }
+        }
+    """
+    import json
+    from datetime import datetime
+
+    try:
+        data = request.get_json() or {}
+
+        simulation_id = data.get('simulation_id')
+        new_status = data.get('status')
+
+        if not simulation_id:
+            return jsonify({
+                "success": False,
+                "error": "请提供 simulation_id"
+            }), 400
+
+        if not new_status:
+            return jsonify({
+                "success": False,
+                "error": "请提供目标状态"
+            }), 400
+
+        # 验证目标状态
+        valid_statuses = ["ready", "paused", "stopped", "completed"]
+        if new_status not in valid_statuses:
+            return jsonify({
+                "success": False,
+                "error": f"无效的状态，支持的状态: {', '.join(valid_statuses)}"
+            }), 400
+
+        # 读取 state.json
+        sim_dir = os.path.join(SIMULATION_DIR, simulation_id)
+        state_file = os.path.join(sim_dir, "state.json")
+
+        if not os.path.exists(state_file):
+            return jsonify({
+                "success": False,
+                "error": "模拟状态文件不存在"
+            }), 404
+
+        with open(state_file, 'r', encoding='utf-8') as f:
+            state_data = json.load(f)
+
+        old_status = state_data.get("status")
+
+        # 检查状态转换是否合理
+        # running 状态需要先停止才能切换其他状态
+        if old_status == "running":
+            return jsonify({
+                "success": False,
+                "error": "模拟正在运行，请先停止模拟"
+            }), 400
+
+        # 更新状态
+        state_data["status"] = new_status
+        state_data["updated_at"] = datetime.now().isoformat()
+
+        with open(state_file, 'w', encoding='utf-8') as f:
+            json.dump(state_data, f, ensure_ascii=False, indent=2)
+
+        logger.info(f"模拟状态已更新: {simulation_id} {old_status} -> {new_status}")
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "simulation_id": simulation_id,
+                "old_status": old_status,
+                "new_status": new_status
+            }
+        })
+
+    except FileNotFoundError:
+        return jsonify({
+            "success": False,
+            "error": "模拟状态文件不存在"
+        }), 404
+
+    except Exception as e:
+        logger.error(f"更新模拟状态失败: {str(e)}")
         return jsonify({
             "success": False,
             "error": str(e),

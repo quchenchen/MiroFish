@@ -13,6 +13,14 @@ from ..config import Config
 from ..services.ontology_generator import OntologyGenerator
 from ..services.graph_builder import GraphBuilderService
 from ..services.text_processor import TextProcessor
+from ..services.entity_extractor import (
+    infer_relation_from_fact,
+    infer_relation_dynamic,
+    discover_relation_types_from_documents,
+    get_project_relation_types,
+    save_project_relation_types
+)
+from ..services.zep_adapter.graph import GraphService, Neo4jRepository
 from ..utils.file_parser import FileParser
 from ..utils.logger import get_logger
 from ..models.task import TaskManager, TaskStatus
@@ -282,10 +290,16 @@ def build_graph():
     try:
         logger.info("=== 开始构建图谱 ===")
         
-        # 检查配置
+        # 检查配置（根据模式）
         errors = []
-        if not Config.ZEP_API_KEY:
-            errors.append("ZEP_API_KEY未配置")
+        if Config.ZEP_USE_LOCAL:
+            if not Config.NEO4J_PASSWORD:
+                errors.append("NEO4J_PASSWORD未配置 (本地模式需要)")
+            if not Config.LLM_API_KEY:
+                errors.append("LLM_API_KEY未配置")
+        else:
+            if not Config.ZEP_API_KEY:
+                errors.append("ZEP_API_KEY未配置")
         if errors:
             logger.error(f"配置错误: {errors}")
             return jsonify({
@@ -433,28 +447,71 @@ def build_graph():
                 )
                 
                 episode_uuids = builder.add_text_batches(
-                    graph_id, 
+                    graph_id,
                     chunks,
                     batch_size=3,
                     progress_callback=add_progress_callback
                 )
-                
-                # 等待Zep处理完成（查询每个episode的processed状态）
-                task_manager.update_task(
-                    task_id,
-                    message="等待Zep处理数据...",
-                    progress=55
-                )
-                
-                def wait_progress_callback(msg, progress_ratio):
-                    progress = 55 + int(progress_ratio * 35)  # 55% - 90%
+
+                # 本地模式：使用 LLM 抽取实体和关系
+                if builder._use_local:
+                    build_logger.info(f"[{task_id}] 本地模式: 开始 LLM 实体抽取...")
                     task_manager.update_task(
                         task_id,
-                        message=msg,
-                        progress=progress
+                        message="开始 LLM 实体抽取...",
+                        progress=60
                     )
-                
-                builder._wait_for_episodes(episode_uuids, wait_progress_callback)
+
+                    try:
+                        import sys
+                        import os
+                        # 添加 backend 目录到 sys.path
+                        backend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+                        if backend_dir not in sys.path:
+                            sys.path.insert(0, backend_dir)
+                        from app.services.entity_extractor import GraphEntityExtractor
+                        extractor = GraphEntityExtractor()
+
+                        # 合并所有文本块进行实体抽取
+                        full_text = "\n\n".join(chunks)
+                        build_logger.info(f"[{task_id}] 开始抽取实体，文本长度: {len(full_text)}")
+
+                        # 执行抽取并存储
+                        extraction_result = extractor.extract_and_store(
+                            graph_id=graph_id,
+                            text=full_text,
+                            ontology=ontology
+                        )
+
+                        build_logger.info(f"[{task_id}] 实体抽取完成: {len(extraction_result.entities)} 个实体, {len(extraction_result.relations)} 个关系")
+
+                        task_manager.update_task(
+                            task_id,
+                            progress=85,
+                            message=f"实体抽取完成: {len(extraction_result.entities)} 个实体, {len(extraction_result.relations)} 个关系"
+                        )
+                    except Exception as e:
+                        build_logger.error(f"[{task_id}] 实体抽取失败: {e}")
+                        import traceback
+                        build_logger.error(traceback.format_exc())
+                        # 继续执行，不让抽取失败阻止整个流程
+                else:
+                    # 云端模式：等待Zep处理完成
+                    task_manager.update_task(
+                        task_id,
+                        message="等待Zep处理数据...",
+                        progress=60
+                    )
+
+                    def wait_progress_callback(msg, progress_ratio):
+                        progress = 60 + int(progress_ratio * 25)  # 60% - 85%
+                        task_manager.update_task(
+                            task_id,
+                            message=msg,
+                            progress=progress
+                        )
+
+                    builder._wait_for_episodes(episode_uuids, wait_progress_callback)
                 
                 # 获取图谱数据
                 task_manager.update_task(
@@ -567,20 +624,15 @@ def get_graph_data(graph_id: str):
     获取图谱数据（节点和边）
     """
     try:
-        if not Config.ZEP_API_KEY:
-            return jsonify({
-                "success": False,
-                "error": "ZEP_API_KEY未配置"
-            }), 500
-        
+        # GraphBuilderService 会根据 ZEP_USE_LOCAL 自动选择模式
         builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
         graph_data = builder.get_graph_data(graph_id)
-        
+
         return jsonify({
             "success": True,
             "data": graph_data
         })
-        
+
     except Exception as e:
         return jsonify({
             "success": False,
@@ -595,21 +647,221 @@ def delete_graph(graph_id: str):
     删除Zep图谱
     """
     try:
-        if not Config.ZEP_API_KEY:
-            return jsonify({
-                "success": False,
-                "error": "ZEP_API_KEY未配置"
-            }), 500
-        
+        # GraphBuilderService 会根据 ZEP_USE_LOCAL 自动选择模式
         builder = GraphBuilderService(api_key=Config.ZEP_API_KEY)
         builder.delete_graph(graph_id)
-        
+
         return jsonify({
             "success": True,
             "message": f"图谱已删除: {graph_id}"
         })
-        
+
     except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@graph_bp.route('/update-relations/<graph_id>', methods=['POST'])
+def update_relation_types(graph_id: str):
+    """
+    批量更新图谱中的关系类型（支持项目上下文）
+
+    根据关系的 fact 描述，智能推断并更新更精确的关系类型
+    支持项目特定的关系类型推断
+
+    Request body:
+        project_id: (可选) 项目ID，用于项目感知的关系推断
+    """
+    try:
+        data = request.get_json() or {}
+        project_id = data.get('project_id')
+
+        # 获取图谱中所有关系
+        neo4j_repo = Neo4jRepository(
+            uri=Config.NEO4J_URI,
+            username=Config.NEO4J_USERNAME,
+            password=Config.NEO4J_PASSWORD
+        )
+        graph_service = GraphService(neo4j_repo)
+
+        # 查询所有需要更新的关系（name为"相关"或"RELATED_TO"）
+        # 注意：关系存储为原生 Neo4j 关系，不是 Edge 节点
+        query = """
+        MATCH (s:Entity)-[r:RELATIONSHIP {name: '相关'}]->(t:Entity)
+        RETURN r.fact as fact, s.name as source_name, t.name as target_name,
+               elementId(r) as rel_id
+        """
+        results = neo4j_repo._execute_query(query, {})
+
+        updated_count = 0
+        skipped_count = 0
+        relation_distribution = {}
+
+        for result in results:
+            fact = result.get("fact", "")
+            source_name = result.get("source_name", "")
+            target_name = result.get("target_name", "")
+            rel_id = result.get("rel_id", "")
+
+            if not fact:
+                skipped_count += 1
+                continue
+
+            # 使用项目感知的关系推断（如果提供了 project_id）
+            if project_id:
+                new_relation_type = infer_relation_dynamic(
+                    fact=fact,
+                    source=source_name,
+                    target=target_name,
+                    project_id=project_id
+                )
+            else:
+                new_relation_type = infer_relation_from_fact(
+                    fact=fact,
+                    source=source_name,
+                    target=target_name
+                )
+
+            # 统计
+            relation_distribution[new_relation_type] = relation_distribution.get(new_relation_type, 0) + 1
+
+            # 更新关系 - 使用原生 Neo4j 关系更新
+            update_query = """
+            MATCH (s:Entity)-[r:RELATIONSHIP]->(t:Entity)
+            WHERE elementId(r) = $rel_id
+            SET r.name = $new_name
+            SET r.relation_type = $new_type
+            RETURN r
+            """
+            neo4j_repo._execute_write(update_query, {
+                "rel_id": rel_id,
+                "new_name": new_relation_type,
+                "new_type": new_relation_type
+            })
+            updated_count += 1
+            logger.info(f"更新关系: 相关 -> {new_relation_type} ({source_name} -> {target_name}, fact: {fact[:40]}...)")
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "updated_count": updated_count,
+                "skipped_count": skipped_count,
+                "relation_distribution": relation_distribution,
+                "project_id": project_id
+            },
+            "message": f"已更新 {updated_count} 条关系，跳过 {skipped_count} 条"
+        })
+
+    except Exception as e:
+        logger.error(f"更新关系类型失败: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@graph_bp.route('/discover-relations/<project_id>', methods=['POST'])
+def discover_relation_types(project_id: str):
+    """
+    从项目文档中发现关系类型
+
+    分析项目中的文档内容，自动发现并提取适合该领域的关系类型
+    发现的结果会保存到项目配置中
+    """
+    try:
+        data = request.get_json() or {}
+        documents = data.get('documents', [])
+        max_types = data.get('max_types', 30)
+        save_to_project = data.get('save', True)
+
+        if not documents:
+            # 尝试从项目中获取文档
+            project = ProjectManager.get_project(project_id)
+            if not project:
+                return jsonify({
+                    "success": False,
+                    "error": f"项目不存在: {project_id}"
+                }), 404
+
+            # 从项目的 sources 中提取文本
+            documents = []
+            if hasattr(project, 'sources') and project.sources:
+                for source in project.sources:
+                    if source.get('content'):
+                        documents.append(source['content'])
+                    elif source.get('path'):
+                        try:
+                            content = FileParser.parse_file(source['path'])
+                            if content:
+                                documents.append(content)
+                        except Exception as e:
+                            logger.warning(f"无法读取文件 {source.get('path')}: {e}")
+
+        if not documents:
+            return jsonify({
+                "success": False,
+                "error": "没有可分析的文档内容"
+            }), 400
+
+        # 执行关系类型发现
+        logger.info(f"开始为项目 {project_id} 发现关系类型，文档数量: {len(documents)}")
+        discovered_types = discover_relation_types_from_documents(
+            documents=documents,
+            max_types=max_types
+        )
+
+        # 保存到项目配置
+        if save_to_project:
+            save_project_relation_types(project_id, discovered_types)
+            logger.info(f"已保存 {len(discovered_types)} 种关系类型到项目 {project_id}")
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "project_id": project_id,
+                "relation_types": discovered_types,
+                "count": len(discovered_types)
+            },
+            "message": f"发现 {len(discovered_types)} 种关系类型"
+        })
+
+    except Exception as e:
+        logger.error(f"发现关系类型失败: {e}")
+        return jsonify({
+            "success": False,
+            "error": str(e),
+            "traceback": traceback.format_exc()
+        }), 500
+
+
+@graph_bp.route('/project/<project_id>/relations', methods=['GET'])
+def get_project_relations(project_id: str):
+    """
+    获取项目特定的关系类型列表
+
+    返回该项目可用的所有关系类型，包括：
+    - 从文档中发现的类型
+    - 在本体中定义的类型
+    - 默认的通用类型
+    """
+    try:
+        relation_types = get_project_relation_types(project_id)
+
+        return jsonify({
+            "success": True,
+            "data": {
+                "project_id": project_id,
+                "relation_types": relation_types,
+                "count": len(relation_types)
+            }
+        })
+
+    except Exception as e:
+        logger.error(f"获取项目关系类型失败: {e}")
         return jsonify({
             "success": False,
             "error": str(e),
