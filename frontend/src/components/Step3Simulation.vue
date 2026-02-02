@@ -756,19 +756,35 @@ watch(() => props.systemLogs?.length, () => {
 onMounted(async () => {
   addLog('Step3 模拟运行初始化')
   if (props.simulationId) {
-    // 先检查模拟是否已在运行，避免刷新页面时重启
+    // 先检查模拟状态，避免刷新页面时重启已完成或正在运行的模拟
     try {
       const runRes = await getRunStatus(props.simulationId)
-      if (runRes.success && runRes.data && runRes.data.runner_status === 'running') {
-        // 模拟已在运行，重连并启动轮询
-        addLog('检测到模拟正在运行，重连中...')
-        runStatus.value = runRes.data
-        phase.value = 1
-        startStatusPolling()
-        startDetailPolling()
-        addLog('✓ 已重连到运行中的模拟')
+      if (runRes.success && runRes.data) {
+        const status = runRes.data.runner_status
+
+        if (status === 'running') {
+          // 模拟正在运行，重连并启动轮询
+          addLog('检测到模拟正在运行，重连中...')
+          runStatus.value = runRes.data
+          phase.value = 1
+          startStatusPolling()
+          startDetailPolling()
+          addLog('✓ 已重连到运行中的模拟')
+        } else if (status === 'completed' || status === 'stopped') {
+          // 模拟已完成，恢复状态并加载历史数据
+          addLog('检测到模拟已完成，加载历史数据...')
+          runStatus.value = runRes.data
+          phase.value = 2
+          // 加载历史动作数据
+          await fetchRunStatusDetail()
+          addLog(`✓ 已恢复模拟状态，共 ${allActions.value.length} 条记录`)
+          emit('update-status', 'completed')
+        } else {
+          // 模拟未运行，启动新模拟
+          await doStartSimulation()
+        }
       } else {
-        // 模拟未运行，启动新模拟
+        // 获取状态失败，尝试启动
         await doStartSimulation()
       }
     } catch (err) {
