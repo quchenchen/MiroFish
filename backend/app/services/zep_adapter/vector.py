@@ -4,6 +4,7 @@ Qdrant 向量数据库服务
 提供语义搜索功能，替代 Zep Cloud 的向量搜索
 """
 
+import os
 import time
 import uuid
 from typing import Dict, Any, List, Optional, Tuple
@@ -23,35 +24,100 @@ class EmbeddingService:
     """
     Embedding 服务
 
-    使用 OpenAI API 或本地模型生成文本嵌入
+    支持：
+    1. 云端 API (OpenAI/阿里云)
+    2. 本地模型 (sentence-transformers)
     """
 
     def __init__(
         self,
         api_key: str = None,
         base_url: str = None,
-        model: str = None
+        model: str = None,
+        use_local: bool = None,
+        local_model_path: str = None
     ):
         """
         初始化 Embedding 服务
 
         Args:
-            api_key: OpenAI API Key (默认从配置读取)
-            base_url: API Base URL (默认从配置读取)
-            model: 模型名称 (默认从配置读取)
+            api_key: OpenAI API Key (云端模式需要)
+            base_url: API Base URL (云端模式需要)
+            model: 模型名称 (云端模式)
+            use_local: 是否使用本地模型
+            local_model_path: 本地模型路径
         """
-        self.api_key = api_key or Config.LLM_API_KEY
-        self.base_url = base_url or Config.LLM_BASE_URL
-        # 从配置获取模型，阿里云使用 text-embedding-v3
-        self.model = model or getattr(Config, 'EMBEDDING_MODEL', 'text-embedding-v3')
+        # 判断是否使用本地模型
+        self.use_local = use_local if use_local is not None else getattr(Config, 'EMBEDDING_USE_LOCAL', False)
+        self.local_model_path = local_model_path or getattr(Config, 'EMBEDDING_LOCAL_MODEL', 'paraphrase-multilingual-MiniLM-L12-v2')
 
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.base_url,
-            timeout=60.0  # 增加超时时间以支持阿里云 API
-        )
+        if self.use_local:
+            # 使用本地 sentence-transformers 模型
+            self._init_local_model()
+        else:
+            # 使用云端 API
+            self.api_key = api_key or Config.LLM_API_KEY
+            self.base_url = base_url or Config.LLM_BASE_URL
+            self.model = model or getattr(Config, 'EMBEDDING_MODEL', 'text-embedding-v3')
 
-        logger.info(f"EmbeddingService 初始化完成: model={self.model}")
+            self.client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.base_url,
+                timeout=60.0
+            )
+            logger.info(f"EmbeddingService 初始化完成 (云端): model={self.model}")
+
+    def _init_local_model(self):
+        """初始化本地 sentence-transformers 模型"""
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            # 设置离线模式，避免联网检查
+            os.environ['TRANSFORMERS_OFFLINE'] = '1'
+            os.environ['HF_HUB_OFFLINE'] = '1'
+            os.environ['HF_HUB_DOWNLOAD_TIMEOUT'] = '120'
+
+            # 使用预装模型路径（避免 Git LFS 问题）
+            # 容器内: /root/.cache/huggingface/hub/local_model
+            # 宿主机: /mnt/sda/MiroFish/models/local_model
+            local_model_dirs = [
+                '/root/.cache/huggingface/hub/local_model',  # 容器内预装模型
+                '/mnt/sda/MiroFish/models/local_model',  # 宿主机模型目录
+                '/mnt/sda/MiroFish/backend/.venv/models/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/e8f8c211226b894fcb81acc59f3b34ba3efd5f42',
+            ]
+
+            model_path_to_load = None
+            for path in local_model_dirs:
+                if os.path.exists(path):
+                    model_path_to_load = path
+                    logger.info(f"使用本地模型路径: {path}")
+                    break
+
+            if not model_path_to_load:
+                # 最后尝试使用 HuggingFace 缓存
+                cache_dir = getattr(Config, 'EMBEDDING_CACHE_DIR', None)
+                if cache_dir and os.path.exists(cache_dir):
+                    model_cache_base = os.path.join(cache_dir, f"models--sentence-transformers--{self.local_model_path}")
+                    snapshots_dir = os.path.join(model_cache_base, "snapshots")
+                    if os.path.exists(snapshots_dir):
+                        snapshots = [d for d in os.listdir(snapshots_dir) if os.path.isdir(os.path.join(snapshots_dir, d))]
+                        if snapshots:
+                            model_path_to_load = os.path.join(snapshots_dir, snapshots[0])
+
+            if not model_path_to_load:
+                model_path_to_load = self.local_model_path
+                logger.warning(f"未找到本地模型文件，尝试使用: {model_path_to_load}")
+
+            logger.info(f"正在加载本地 embedding 模型: {self.local_model_path}")
+            self.local_model = SentenceTransformer(model_path_to_load)
+            self.vector_size = self.local_model.get_sentence_embedding_dimension()
+            logger.info(f"本地 embedding 模型加载完成: vector_size={self.vector_size}")
+        except ImportError:
+            logger.error("sentence_transformers 未安装，请运行: pip install sentence-transformers")
+            raise
+        except Exception as e:
+            logger.error(f"本地模型加载失败: {e}")
+            raise
 
     def embed(self, text: str) -> List[float]:
         """
@@ -63,6 +129,23 @@ class EmbeddingService:
         Returns:
             嵌入向量
         """
+        if self.use_local:
+            return self._embed_local(text)
+        else:
+            return self._embed_remote(text)
+
+    def _embed_local(self, text: str) -> List[float]:
+        """使用本地模型生成嵌入"""
+        try:
+            embedding = self.local_model.encode(text, convert_to_numpy=True)
+            return embedding.tolist()
+        except Exception as e:
+            logger.error(f"本地模型生成嵌入失败: {e}")
+            # 返回零向量作为降级方案
+            return [0.0] * self.vector_size
+
+    def _embed_remote(self, text: str) -> List[float]:
+        """使用云端 API 生成嵌入"""
         try:
             response = self.client.embeddings.create(
                 model=self.model,
@@ -70,7 +153,7 @@ class EmbeddingService:
             )
             return response.data[0].embedding
         except Exception as e:
-            logger.error(f"生成嵌入失败: {e}")
+            logger.error(f"云端 API 生成嵌入失败: {e}")
             # 返回零向量作为降级方案 (根据模型维度)
             dim = 1024 if "text-embedding-v3" in self.model or "embedding-v" in self.model else 1536
             return [0.0] * dim
@@ -85,6 +168,22 @@ class EmbeddingService:
         Returns:
             嵌入向量列表
         """
+        if self.use_local:
+            return self._embed_batch_local(texts)
+        else:
+            return self._embed_batch_remote(texts)
+
+    def _embed_batch_local(self, texts: List[str]) -> List[List[float]]:
+        """使用本地模型批量生成嵌入"""
+        try:
+            embeddings = self.local_model.encode(texts, convert_to_numpy=True)
+            return embeddings.tolist()
+        except Exception as e:
+            logger.error(f"本地模型批量生成嵌入失败: {e}")
+            return [[0.0] * self.vector_size for _ in texts]
+
+    def _embed_batch_remote(self, texts: List[str]) -> List[List[float]]:
+        """使用云端 API 批量生成嵌入"""
         try:
             response = self.client.embeddings.create(
                 model=self.model,
@@ -92,9 +191,25 @@ class EmbeddingService:
             )
             return [item.embedding for item in response.data]
         except Exception as e:
-            logger.error(f"批量生成嵌入失败: {e}")
+            logger.error(f"云端 API 批量生成嵌入失败: {e}")
             dim = 1024 if "text-embedding-v3" in self.model or "embedding-v" in self.model else 1536
             return [[0.0] * dim for _ in texts]
+
+    def get_vector_size(self) -> int:
+        """获取向量维度"""
+        if self.use_local:
+            return self.vector_size
+        else:
+            # 云端模型维度
+            model = self.model
+            if "text-embedding-v3" in model or "embedding-v" in model:
+                return 1024
+            elif "text-embedding-3-large" in model:
+                return 3072
+            elif "text-embedding-3-small" in model:
+                return 1536
+            else:
+                return 1536
 
 
 class QdrantVectorService:
@@ -185,15 +300,7 @@ class QdrantVectorService:
 
     def _get_vector_size(self) -> int:
         """获取当前 embedding 模型的向量维度"""
-        model = self.embedding.model
-        if "text-embedding-v3" in model or "embedding-v" in model:
-            return 1024
-        elif "text-embedding-3-large" in model:
-            return 3072
-        elif "text-embedding-3-small" in model:
-            return 1536
-        else:
-            return 1536  # 默认
+        return self.embedding.get_vector_size()
 
     def upsert_edge(
         self,

@@ -16,6 +16,9 @@ dependencies = [
     # LLM 相关
     "openai>=1.0.0",
 
+    # 本地 Embedding 模型 (可选)
+    "sentence-transformers>=3.0.0",
+
     # Zep Cloud (保留用于云端模式)
     "zep-cloud==3.13.0",
 

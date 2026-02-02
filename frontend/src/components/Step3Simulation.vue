@@ -392,25 +392,26 @@ const resetAllState = () => {
 }
 
 // 启动模拟
-const doStartSimulation = async () => {
+const doStartSimulation = async (forceRestart = false) => {
   if (!props.simulationId) {
     addLog('错误：缺少 simulationId')
     return
   }
-  
+
   // 先重置所有状态，确保不会受到上一次模拟的影响
   resetAllState()
-  
+
   isStarting.value = true
   startError.value = null
   addLog('正在启动双平台并行模拟...')
   emit('update-status', 'processing')
-  
+
   try {
     const params = {
       simulation_id: props.simulationId,
       platform: 'parallel',
-      force: true,  // 强制重新开始
+      // 只在明确需要强制重启时才使用 force，避免页面刷新时重启正在运行的模拟
+      force: forceRestart,
       enable_graph_memory_update: true  // 开启动态图谱更新
     }
     
@@ -483,9 +484,9 @@ const handleResetStatus = async () => {
       simulationStatus.value = 'ready'
       startError.value = null
 
-      // 自动重新启动
+      // 自动重新启动（使用 force 重启）
       addLog('正在重新启动模拟...')
-      await doStartSimulation()
+      await doStartSimulation(true)
     } else {
       addLog(`✗ 状态更新失败: ${res.error || '未知错误'}`)
     }
@@ -752,10 +753,29 @@ watch(() => props.systemLogs?.length, () => {
   })
 })
 
-onMounted(() => {
+onMounted(async () => {
   addLog('Step3 模拟运行初始化')
   if (props.simulationId) {
-    doStartSimulation()
+    // 先检查模拟是否已在运行，避免刷新页面时重启
+    try {
+      const runRes = await getRunStatus(props.simulationId)
+      if (runRes.success && runRes.data && runRes.data.runner_status === 'running') {
+        // 模拟已在运行，重连并启动轮询
+        addLog('检测到模拟正在运行，重连中...')
+        runStatus.value = runRes.data
+        phase.value = 1
+        startStatusPolling()
+        startDetailPolling()
+        addLog('✓ 已重连到运行中的模拟')
+      } else {
+        // 模拟未运行，启动新模拟
+        await doStartSimulation()
+      }
+    } catch (err) {
+      // 获取状态失败，尝试启动
+      addLog('无法获取运行状态，尝试启动模拟...')
+      await doStartSimulation()
+    }
   }
 })
 

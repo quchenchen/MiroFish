@@ -49,15 +49,36 @@ class Config:
     ZEP_USE_LOCAL = os.environ.get('ZEP_USE_LOCAL', 'false').lower() == 'true'
 
     # Neo4j 配置 (本地模式)
-    NEO4J_URI = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
+    _neo4j_uri = os.environ.get('NEO4J_URI', 'bolt://localhost:7687')
+    # 如果不在 Docker 中运行，将容器名替换为 localhost
+    if not IN_DOCKER:
+        if 'neo4j:7687' in _neo4j_uri:
+            _neo4j_uri = _neo4j_uri.replace('bolt://neo4j:7687', 'bolt://localhost:7687')
+    NEO4J_URI = _neo4j_uri
     NEO4J_USERNAME = os.environ.get('NEO4J_USERNAME', 'neo4j')
     NEO4J_PASSWORD = os.environ.get('NEO4J_PASSWORD')  # 必须显式配置
 
     # Qdrant 配置 (本地模式)
-    QDRANT_URL = os.environ.get('QDRANT_URL', 'http://localhost:6333')
+    _qdrant_url = os.environ.get('QDRANT_URL', 'http://localhost:6333')
+    # 如果不在 Docker 中运行，将容器名替换为 localhost
+    if not IN_DOCKER:
+        if 'qdrant:6333' in _qdrant_url:
+            _qdrant_url = _qdrant_url.replace('http://qdrant:6333', 'http://localhost:6333')
+    QDRANT_URL = _qdrant_url
 
-    # Embedding 模型配置 (本地模式，默认阿里云)
+    # Embedding 模型配置
     EMBEDDING_MODEL = os.environ.get('EMBEDDING_MODEL', 'text-embedding-v3')
+
+    # 本地 Embedding 模型配置
+    # 设置为 true 启用本地模型 (sentence-transformers)
+    EMBEDDING_USE_LOCAL = os.environ.get('EMBEDDING_USE_LOCAL', 'false').lower() == 'true'
+    # 本地模型名称或路径 (默认使用多语言轻量模型)
+    EMBEDDING_LOCAL_MODEL = os.environ.get(
+        'EMBEDDING_LOCAL_MODEL',
+        'paraphrase-multilingual-MiniLM-L12-v2'  # 支持中英文，384维，速度快
+    )
+    # 模型缓存目录
+    EMBEDDING_CACHE_DIR = os.environ.get('EMBEDDING_CACHE_DIR', '')
 
     # 文件上传配置
     MAX_CONTENT_LENGTH = 50 * 1024 * 1024  # 50MB

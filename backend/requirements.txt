@@ -13,6 +13,9 @@ flask-cors>=6.0.0
 # OpenAI SDK（统一使用 OpenAI 格式调用 LLM）
 openai>=1.0.0
 
+# 本地 Embedding 模型（可选，用于本地化向量生成）
+sentence-transformers>=3.0.0
+
 # ============= Zep Cloud =============
 zep-cloud==3.13.0
 

@@ -7,12 +7,16 @@ services:
     container_name: mirofish
     env_file:
       - .env
+    environment:
+      - DOCKER_ENV=true
     ports:
-      - "3000:3000"
+      - "3001:3001"
       - "5001:5001"
     restart: unless-stopped
     volumes:
       - ./backend/uploads:/app/backend/uploads
+      - ./models/local_model:/root/.cache/huggingface/hub/local_model  # 本地 embedding 模型
+      - hf_cache:/root/.cache/huggingface/hub  # HuggingFace 模型缓存（用于其他模型）
     depends_on:
       - neo4j
       - qdrant
@@ -66,3 +70,4 @@ volumes:
   neo4j_data:
   neo4j_logs:
   qdrant_data:
+  hf_cache:  # HuggingFace 模型缓存卷

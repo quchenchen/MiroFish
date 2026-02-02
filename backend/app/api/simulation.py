@@ -1622,13 +1622,15 @@ def start_simulation():
             "success": True,
             "data": response_data
         })
-        
+
     except ValueError as e:
+        logger.error(f"启动模拟 ValueError: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({
             "success": False,
             "error": str(e)
         }), 400
-        
+
     except Exception as e:
         logger.error(f"启动模拟失败: {str(e)}")
         return jsonify({
