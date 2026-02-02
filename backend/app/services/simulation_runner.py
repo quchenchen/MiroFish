@@ -228,13 +228,58 @@ class SimulationRunner:
     
     @classmethod
     def get_run_state(cls, simulation_id: str) -> Optional[SimulationRunState]:
-        """获取运行状态"""
+        """
+        获取运行状态（带进程活性检测）
+
+        如果保存的状态显示正在运行，但实际进程已不存在，
+        会自动修正状态为 stopped
+        """
+        # 先检查内存缓存
         if simulation_id in cls._run_states:
-            return cls._run_states[simulation_id]
-        
+            cached_state = cls._run_states[simulation_id]
+            # 如果缓存状态是 running，检查进程是否还存在
+            if cached_state.runner_status == RunnerStatus.RUNNING:
+                process = cls._processes.get(simulation_id)
+                if process and process.poll() is None:
+                    # 进程确实在运行
+                    return cached_state
+                else:
+                    # 进程不存在了，更新状态
+                    logger.info(f"检测到模拟进程已结束: {simulation_id}, 更新状态为 stopped")
+                    cached_state.runner_status = RunnerStatus.STOPPED
+                    cached_state.twitter_running = False
+                    cached_state.reddit_running = False
+                    cls._save_run_state(cached_state)
+                    return cached_state
+            return cached_state
+
         # 尝试从文件加载
         state = cls._load_run_state(simulation_id)
         if state:
+            # 如果保存的状态是 running，检查进程是否还存在
+            if state.runner_status == RunnerStatus.RUNNING:
+                # 检查是否有保存的 PID
+                if state.process_pid:
+                    try:
+                        # 检查进程是否存在（不发送信号，只检查）
+                        os.kill(state.process_pid, 0)
+                    except (OSError, ProcessLookupError):
+                        # 进程不存在，更新状态
+                        logger.info(f"检测到模拟进程 (PID={state.process_pid}) 已不存在: {simulation_id}, 更新状态为 stopped")
+                        state.runner_status = RunnerStatus.STOPPED
+                        state.twitter_running = False
+                        state.reddit_running = False
+                        cls._save_run_state(state)
+                    except Exception as e:
+                        logger.warning(f"检查进程状态时出错: {e}")
+                else:
+                    # 没有 PID 信息，说明进程已不存在
+                    logger.info(f"模拟状态显示 running 但无进程信息: {simulation_id}, 更新状态为 stopped")
+                    state.runner_status = RunnerStatus.STOPPED
+                    state.twitter_running = False
+                    state.reddit_running = False
+                    cls._save_run_state(state)
+
             cls._run_states[simulation_id] = state
         return state
     

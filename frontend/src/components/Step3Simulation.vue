@@ -398,8 +398,10 @@ const doStartSimulation = async (forceRestart = false) => {
     return
   }
 
-  // 先重置所有状态，确保不会受到上一次模拟的影响
-  resetAllState()
+  // 只在强制重启时才重置所有状态，避免覆盖已加载的历史数据
+  if (forceRestart) {
+    resetAllState()
+  }
 
   isStarting.value = true
   startError.value = null
@@ -414,26 +416,28 @@ const doStartSimulation = async (forceRestart = false) => {
       force: forceRestart,
       enable_graph_memory_update: true  // 开启动态图谱更新
     }
-    
+
     if (props.maxRounds) {
       params.max_rounds = props.maxRounds
       addLog(`设置最大模拟轮数: ${props.maxRounds}`)
     }
-    
+
     addLog('已开启动态图谱更新模式')
-    
+
     const res = await startSimulation(params)
-    
+
     if (res.success && res.data) {
       if (res.data.force_restarted) {
         addLog('✓ 已清理旧的模拟日志，重新开始模拟')
+        // 强制重启后需要重置状态
+        resetAllState()
       }
       addLog('✓ 模拟引擎启动成功')
       addLog(`  ├─ PID: ${res.data.process_pid || '-'}`)
-      
+
       phase.value = 1
       runStatus.value = res.data
-      
+
       startStatusPolling()
       startDetailPolling()
     } else {
@@ -761,6 +765,7 @@ onMounted(async () => {
       const runRes = await getRunStatus(props.simulationId)
       if (runRes.success && runRes.data) {
         const status = runRes.data.runner_status
+        const hasActions = runRes.data.total_actions_count > 0
 
         if (status === 'running') {
           // 模拟正在运行，重连并启动轮询
@@ -770,7 +775,7 @@ onMounted(async () => {
           startStatusPolling()
           startDetailPolling()
           addLog('✓ 已重连到运行中的模拟')
-        } else if (status === 'completed' || status === 'stopped') {
+        } else if (status === 'completed') {
           // 模拟已完成，恢复状态并加载历史数据
           addLog('检测到模拟已完成，加载历史数据...')
           runStatus.value = runRes.data
@@ -779,12 +784,23 @@ onMounted(async () => {
           await fetchRunStatusDetail()
           addLog(`✓ 已恢复模拟状态，共 ${allActions.value.length} 条记录`)
           emit('update-status', 'completed')
+        } else if (status === 'stopped' && hasActions) {
+          // 模拟已停止但有历史数据，恢复状态（可能是服务器重启导致的停止）
+          addLog('检测到模拟已停止，但存在历史数据，恢复状态...')
+          runStatus.value = runRes.data
+          phase.value = 2
+          // 加载历史动作数据
+          await fetchRunStatusDetail()
+          addLog(`✓ 已恢复模拟状态，共 ${allActions.value.length} 条记录（模拟已停止）`)
+          emit('update-status', 'completed')
         } else {
-          // 模拟未运行，启动新模拟
+          // 模拟未运行且无历史数据，启动新模拟
+          addLog('模拟未运行，启动新模拟...')
           await doStartSimulation()
         }
       } else {
         // 获取状态失败，尝试启动
+        addLog('无法获取运行状态，尝试启动模拟...')
         await doStartSimulation()
       }
     } catch (err) {
