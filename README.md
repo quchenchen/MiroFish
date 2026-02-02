@@ -80,7 +80,7 @@ MiroFish 致力于打造映射现实的群体智能镜像，通过捕捉个体�
 
 ## 🔄 工作流程
 
-1. **图谱构建**：现实种子提取 & 个体与群体记忆注入 & GraphRAG构建
+1. **图谱构建**：现实种子提取 & 个体与群体记忆注入 & GraphRAG构建（本地模式使用 Neo4j + Qdrant）
 2. **环境搭建**：实体关系抽取 & 人设生成 & 环境配置Agent注入仿真参数
 3. **开始模拟**：双平台并行模拟 & 自动解析预测需求 & 动态更新时序记忆
 4. **报告生成**：ReportAgent拥有丰富的工具集与模拟后环境进行深度交互
@@ -117,8 +117,13 @@ LLM_API_KEY=your_api_key
 LLM_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
 LLM_MODEL_NAME=qwen-plus
 
-# Zep Cloud 配置
-# 每月免费额度即可支撑简单使用：https://app.getzep.com/
+# 图谱记忆配置（二选一）
+# 方案A：本地模式（推荐，完全免费，使用 Neo4j + Qdrant）
+ZEP_USE_LOCAL=true
+NEO4J_PASSWORD=your_neo4j_password  # 自定义 Neo4j 密码
+EMBEDDING_USE_LOCAL=true            # 使用本地 embedding 模型
+
+# 方案B：云端模式（使用 Zep Cloud，需要注册）
 ZEP_API_KEY=your_zep_api_key
 ```
 
@@ -157,19 +162,51 @@ npm run backend   # 仅启动后端
 npm run frontend  # 仅启动前端
 ```
 
-### 二、Docker 部署
+### 二、Docker 部署（推荐本地模式）
 
 ```bash
-# 1. 配置环境变量（同源码部署）
+# 1. 配置环境变量
 cp .env.example .env
+# 编辑 .env，设置 ZEP_USE_LOCAL=true 和 NEO4J_PASSWORD
 
-# 2. 拉取镜像并启动
+# 2. 启动所有服务（包括 Neo4j + Qdrant）
 docker compose up -d
 ```
 
-默认会读取根目录下的 `.env`，并映射端口 `3000（前端）/5001（后端）`
+**服务说明：**
+| 服务 | 端口 | 说明 |
+|------|------|------|
+| mirofish | 3001/5001 | 主应用（前端/后端） |
+| neo4j | 7474/7687 | 图数据库（Web界面/Bolt协议） |
+| qdrant | 6333/6334 | 向量数据库（HTTP/gRPC） |
 
 > 在 `docker-compose.yml` 中已通过注释提供加速镜像地址，可按需替换
+
+### 三、本地模式说明
+
+MiroFish 支持两种图谱记忆模式：
+
+#### 本地模式（推荐）
+- **完全免费**：使用 Neo4j（图数据库）+ Qdrant（向量数据库）
+- **数据私有**：所有数据存储在本地，不上传云端
+- **离线运行**：支持离线 embedding 模型，无需联网
+- **一键启动**：Docker Compose 自动拉起所有依赖服务
+
+```env
+ZEP_USE_LOCAL=true
+NEO4J_PASSWORD=your_password
+EMBEDDING_USE_LOCAL=true
+```
+
+#### 云端模式
+- **开箱即用**：使用 Zep Cloud 服务，无需本地数据库
+- **免费额度**：每月有限额，适合轻度使用
+- **需要注册**：需在 https://app.getzep.com/ 注册获取 API Key
+
+```env
+ZEP_USE_LOCAL=false
+ZEP_API_KEY=your_zep_api_key
+```
 
 ## 📬 更多交流
 
