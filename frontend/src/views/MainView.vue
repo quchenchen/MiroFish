@@ -75,26 +75,34 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import GraphPanel from '../components/GraphPanel.vue'
 import Step1GraphBuild from '../components/Step1GraphBuild.vue'
 import Step2EnvSetup from '../components/Step2EnvSetup.vue'
 import { generateOntology, getProject, buildGraph, getTaskStatus, getGraphData } from '../api/graph'
-import { getPendingUpload, clearPendingUpload } from '../store/pendingUpload'
+import { getPendingUpload, clearPendingUpload, getRestorableFileInfo } from '../store/pendingUpload'
+import {
+  saveCurrentProjectId, getCurrentProjectId,
+  saveCurrentSimulationId, getCurrentSimulationId,
+  saveSystemLogs, getSystemLogs,
+  saveViewMode, getViewMode,
+  saveSessionState, getSessionState, STATE_KEYS
+} from '../store/sessionState'
 
 const route = useRoute()
 const router = useRouter()
 
-// Layout State
-const viewMode = ref('split') // graph | split | workbench
+// Layout State - 从 sessionStorage 恢复 viewMode
+const viewMode = ref(getViewMode()) // graph | split | workbench
 
 // Step State
 const currentStep = ref(1) // 1: 图谱构建, 2: 环境搭建, 3: 开始模拟, 4: 报告生成, 5: 深度互动
 const stepNames = ['图谱构建', '环境搭建', '开始模拟', '报告生成', '深度互动']
 
 // Data State
-const currentProjectId = ref(route.params.projectId)
+// 优先使用路由参数，如果没有则从 sessionStorage 恢复
+const currentProjectId = ref(route.params.projectId || getCurrentProjectId())
 const loading = ref(false)
 const graphLoading = ref(false)
 const error = ref('')
@@ -179,9 +187,35 @@ const handleGoBack = () => {
 
 const initProject = async () => {
   addLog('Project view initialized.')
+
+  // 如果 URL 是 'new'，检查是否有待上传数据
   if (currentProjectId.value === 'new') {
+    const pending = getPendingUpload()
+
+    // 如果没有待上传数据，检查是否有可恢复的信息
+    if (!pending.isPending || pending.files.length === 0) {
+      const restorable = getRestorableFileInfo()
+
+      if (restorable.hasPendingData) {
+        // 有待恢复的数据，但 File 对象在刷新后丢失
+        error.value = `检测到未完成的上传（${restorable.fileCount} 个文件），请返回首页重新选择文件继续。`
+        addLog(`发现可恢复数据: ${restorable.fileNames.join(', ')}`)
+        addLog('刷新后 File 对象丢失，请重新选择文件')
+        currentPhase.value = -1
+        loading.value = false
+        return
+      } else {
+        // 没有任何待处理数据
+        error.value = '没有待上传的文件，请返回首页重新操作'
+        addLog('Error: No pending files found for new project.')
+        loading.value = false
+        return
+      }
+    }
+
     await handleNewProject()
   } else {
+    // 加载已有项目
     await loadProject()
   }
 }
@@ -193,23 +227,26 @@ const handleNewProject = async () => {
     addLog('Error: No pending files found for new project.')
     return
   }
-  
+
   try {
     loading.value = true
     currentPhase.value = 0
     ontologyProgress.value = { message: 'Uploading and analyzing docs...' }
     addLog('Starting ontology generation: Uploading files...')
-    
+
     const formData = new FormData()
     pending.files.forEach(f => formData.append('files', f))
     formData.append('simulation_requirement', pending.simulationRequirement)
-    
+
     const res = await generateOntology(formData)
     if (res.success) {
       clearPendingUpload()
       currentProjectId.value = res.data.project_id
       projectData.value = res.data
-      
+
+      // 保存项目 ID 到 sessionStorage，支持刷新后恢复
+      saveCurrentProjectId(res.data.project_id)
+
       router.replace({ name: 'Process', params: { projectId: res.data.project_id } })
       ontologyProgress.value = null
       addLog(`Ontology generated successfully for project ${res.data.project_id}`)
@@ -434,7 +471,35 @@ const stopGraphPolling = () => {
 }
 
 onMounted(() => {
+  // 恢复系统日志
+  const savedLogs = getSystemLogs()
+  if (savedLogs.length > 0) {
+    systemLogs.value = savedLogs
+    addLog('页面刷新，已恢复之前的日志')
+  } else {
+    addLog('Project view initialized.')
+  }
+
   initProject()
+})
+
+// 监听状态变化并保存到 sessionStorage
+watch(viewMode, (newVal) => {
+  saveViewMode(newVal)
+})
+
+watch(systemLogs, (newVal) => {
+  saveSystemLogs(newVal)
+}, { deep: true })
+
+watch(currentProjectId, (newVal) => {
+  if (newVal && newVal !== 'new') {
+    saveCurrentProjectId(newVal)
+  }
+})
+
+watch(currentPhase, (newVal) => {
+  saveSessionState(STATE_KEYS.CURRENT_PHASE, newVal)
 })
 
 onUnmounted(() => {

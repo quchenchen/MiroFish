@@ -64,12 +64,17 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import GraphPanel from '../components/GraphPanel.vue'
 import Step2EnvSetup from '../components/Step2EnvSetup.vue'
 import { getProject, getGraphData } from '../api/graph'
 import { getSimulation, stopSimulation, getEnvStatus, closeSimulationEnv } from '../api/simulation'
+import {
+  getCurrentSimulationId, saveCurrentSimulationId,
+  saveSystemLogs, getSystemLogs,
+  saveViewMode, getViewMode
+} from '../store/sessionState'
 
 const route = useRoute()
 const router = useRouter()
@@ -79,11 +84,12 @@ const props = defineProps({
   simulationId: String
 })
 
-// Layout State
-const viewMode = ref('split')
+// Layout State - 从 sessionStorage 恢复 viewMode
+const viewMode = ref(getViewMode())
 
 // Data State
-const currentSimulationId = ref(route.params.simulationId)
+// 优先使用路由参数，如果没有则从 sessionStorage 恢复
+const currentSimulationId = ref(route.params.simulationId || getCurrentSimulationId())
 const projectData = ref(null)
 const graphData = ref(null)
 const graphLoading = ref(false)
@@ -287,13 +293,40 @@ const refreshGraph = () => {
 }
 
 onMounted(async () => {
-  addLog('SimulationView 初始化')
-  
+  // 恢复系统日志
+  const savedLogs = getSystemLogs()
+  if (savedLogs.length > 0) {
+    systemLogs.value = savedLogs
+    addLog('页面刷新，已恢复之前的日志')
+  } else {
+    addLog('SimulationView 初始化')
+  }
+
+  // 保存当前模拟 ID
+  if (currentSimulationId.value) {
+    saveCurrentSimulationId(currentSimulationId.value)
+  }
+
   // 检查并关闭正在运行的模拟（用户从 Step 3 返回时）
   await checkAndStopRunningSimulation()
-  
+
   // 加载模拟数据
   loadSimulationData()
+})
+
+// 监听状态变化并保存到 sessionStorage
+watch(viewMode, (newVal) => {
+  saveViewMode(newVal)
+})
+
+watch(systemLogs, (newVal) => {
+  saveSystemLogs(newVal)
+}, { deep: true })
+
+watch(currentSimulationId, (newVal) => {
+  if (newVal) {
+    saveCurrentSimulationId(newVal)
+  }
 })
 </script>
 

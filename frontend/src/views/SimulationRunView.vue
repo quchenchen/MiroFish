@@ -73,6 +73,12 @@ import GraphPanel from '../components/GraphPanel.vue'
 import Step3Simulation from '../components/Step3Simulation.vue'
 import { getProject, getGraphData } from '../api/graph'
 import { getSimulation, getSimulationConfig, stopSimulation, closeSimulationEnv, getEnvStatus } from '../api/simulation'
+import {
+  getCurrentSimulationId, saveCurrentSimulationId,
+  saveSystemLogs, getSystemLogs,
+  saveViewMode, getViewMode,
+  saveSessionState, getSessionState, STATE_KEYS
+} from '../store/sessionState'
 
 const route = useRoute()
 const router = useRouter()
@@ -82,11 +88,12 @@ const props = defineProps({
   simulationId: String
 })
 
-// Layout State
-const viewMode = ref('split')
+// Layout State - 从 sessionStorage 恢复 viewMode
+const viewMode = ref(getViewMode())
 
 // Data State
-const currentSimulationId = ref(route.params.simulationId)
+// 优先使用路由参数，如果没有则从 sessionStorage 恢复
+const currentSimulationId = ref(route.params.simulationId || getCurrentSimulationId())
 // 直接在初始化时从 query 参数获取 maxRounds，确保子组件能立即获取到值
 const maxRounds = ref(route.query.maxRounds ? parseInt(route.query.maxRounds) : null)
 const minutesPerRound = ref(30) // 默认每轮30分钟
@@ -295,14 +302,41 @@ watch(isSimulating, (newValue) => {
 }, { immediate: true })
 
 onMounted(() => {
-  addLog('SimulationRunView 初始化')
-  
+  // 恢复系统日志
+  const savedLogs = getSystemLogs()
+  if (savedLogs.length > 0) {
+    systemLogs.value = savedLogs
+    addLog('页面刷新，已恢复之前的日志')
+  } else {
+    addLog('SimulationRunView 初始化')
+  }
+
   // 记录 maxRounds 配置（值已在初始化时从 query 参数获取）
   if (maxRounds.value) {
     addLog(`自定义模拟轮数: ${maxRounds.value}`)
   }
-  
+
+  // 保存当前模拟 ID
+  if (currentSimulationId.value) {
+    saveCurrentSimulationId(currentSimulationId.value)
+  }
+
   loadSimulationData()
+})
+
+// 监听状态变化并保存到 sessionStorage
+watch(viewMode, (newVal) => {
+  saveViewMode(newVal)
+})
+
+watch(systemLogs, (newVal) => {
+  saveSystemLogs(newVal)
+}, { deep: true })
+
+watch(currentSimulationId, (newVal) => {
+  if (newVal) {
+    saveCurrentSimulationId(newVal)
+  }
 })
 
 onUnmounted(() => {
