@@ -68,3 +68,5 @@ data/
 .worktrees/
 .security-key
 logs/security/
+models/
+restart_container.sh
